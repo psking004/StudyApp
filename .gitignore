@@ -1,0 +1,19 @@
+# Build output
+build/
+.gradle/
+*.apk
+*.aab
+build.log
+
+# Machine-specific
+local.properties
+.idea/
+*.iml
+
+# Secrets / signing — never commit
+keystore.properties
+*.jks
+*.keystore
+
+# Real Firebase config is kept out of the public repo; copy the example
+app/src/main/assets/firebase_config.json

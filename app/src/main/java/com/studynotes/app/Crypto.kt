@@ -81,6 +81,20 @@ class Crypto(ctx: Context) {
         return Base64.encodeToString(iv + c.doFinal(text.toByteArray()), Base64.NO_WRAP)
     }
 
+    /** Encrypts raw bytes (photos/files) with the same per-chat AES-GCM key. Output = 12-byte IV + ciphertext+tag. */
+    fun encryptBytes(chatId: String, peerPub: String, data: ByteArray): ByteArray {
+        val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.ENCRYPT_MODE, chatKey(chatId, peerPub), GCMParameterSpec(128, iv))
+        return iv + c.doFinal(data)
+    }
+
+    fun decryptBytes(chatId: String, peerPub: String, raw: ByteArray): ByteArray? = try {
+        val c = Cipher.getInstance("AES/GCM/NoPadding")
+        c.init(Cipher.DECRYPT_MODE, chatKey(chatId, peerPub), GCMParameterSpec(128, raw, 0, 12))
+        c.doFinal(raw, 12, raw.size - 12)
+    } catch (e: Exception) { null }
+
     fun decrypt(chatId: String, peerPub: String, data: String): String = try {
         val raw = Base64.decode(data, Base64.NO_WRAP)
         val c = Cipher.getInstance("AES/GCM/NoPadding")

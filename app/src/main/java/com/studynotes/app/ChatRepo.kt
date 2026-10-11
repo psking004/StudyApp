@@ -12,12 +12,29 @@ import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.Query
+import com.google.firebase.storage.FirebaseStorage
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.OpenableColumns
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.File
 
 data class ChatItem(val id: String, val peerUid: String, val peerName: String, val peerPub: String,
                     val lastText: String, val updated: Long, val lastFrom: String)
-data class Msg(val id: String, val from: String, val text: String, val ts: Long, val delivered: Boolean, val pending: Boolean)
+/** type: "text" (default, also for old docs without a type), "image" or "file". name/mime/size/path only for attachments. */
+data class Msg(val id: String, val from: String, val text: String, val ts: Long, val delivered: Boolean, val pending: Boolean,
+               val type: String = "text", val name: String = "", val mime: String = "", val size: Long = 0, val path: String = "")
+data class Upload(val id: String, val chatId: String, val name: String, val isImage: Boolean, val progress: Float)
+
+const val MAX_ATTACHMENT_BYTES = 25L * 1024 * 1024
 
 class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val onIncoming: () -> Unit) {
     var configured = false; private set
@@ -29,7 +46,13 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
     val messages = mutableStateMapOf<String, List<Msg>>()
     val unread = mutableStateMapOf<String, Int>()
     var openChat: String? = null
+    val uploads = mutableStateMapOf<String, Upload>()
+    /** WebRTC ICE servers: Google STUN plus optional TURN from firebase_config.json. */
+    var iceConfig: List<Triple<List<String>, String, String>> = emptyList(); private set
     private var db: FirebaseFirestore? = null
+    private var storage: FirebaseStorage? = null
+    internal val firestore: FirebaseFirestore? get() = db
+    private val startLock = Mutex()
     private var auth: FirebaseAuth? = null
     private var chatsReg: ListenerRegistration? = null
     private val msgRegs = HashMap<String, ListenerRegistration>()
@@ -42,15 +65,37 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
             if (key.isNotBlank() && !key.startsWith("PASTE")) {
                 val opts = FirebaseOptions.Builder().setApiKey(key).setApplicationId(j.getString("appId"))
                     .setProjectId(j.getString("projectId")).setGcmSenderId(j.optString("messagingSenderId"))
-                    .apply { j.optString("storageBucket").takeIf { it.isNotBlank() }?.let { setStorageBucket(it) } }.build()
+                    .setStorageBucket(bucketFrom(j)).build()
                 val app = if (FirebaseApp.getApps(ctx).isEmpty()) FirebaseApp.initializeApp(ctx, opts) else FirebaseApp.getInstance()
                 db = FirebaseFirestore.getInstance(app); auth = FirebaseAuth.getInstance(app)
+                storage = try { FirebaseStorage.getInstance(app) } catch (_: Exception) { null }
+                iceConfig = iceFrom(j)
                 configured = true
             }
         } catch (e: Exception) { error.value = "The app couldn't load its server settings. Please reinstall the latest version." }
     }
 
-    suspend fun start() {
+    /** Bucket: "storage_bucket" key, then legacy "storageBucket", else the default <projectId>.firebasestorage.app. */
+    private fun bucketFrom(j: JSONObject): String {
+        val b = j.optString("storage_bucket").ifBlank { j.optString("storageBucket") }.trim()
+        return b.removePrefix("gs://").ifBlank { j.getString("projectId") + ".firebasestorage.app" }
+    }
+
+    private fun iceFrom(j: JSONObject): List<Triple<List<String>, String, String>> {
+        val out = mutableListOf(Triple(listOf("stun:stun.l.google.com:19302"), "", ""))
+        val raw = j.opt("turn_urls")
+        val urls = when (raw) {
+            is JSONArray -> (0 until raw.length()).map { raw.optString(it) }
+            is String -> raw.split(',')
+            else -> emptyList()
+        }.map { it.trim() }.filter { it.isNotBlank() }
+        if (urls.isNotEmpty()) out += Triple(urls, j.optString("turn_username"), j.optString("turn_credential"))
+        return out
+    }
+
+    suspend fun start() = startLock.withLock { startInner() }
+
+    private suspend fun startInner() {
         if (!configured || ready.value) return
         error.value = null
         try {
@@ -119,6 +164,7 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
 
     private fun listenChats() {
         val me = myUid.value ?: return
+        CallManager.attach(ctx, this)
         chatsReg?.remove()
         chatsReg = db!!.collection("chats").whereArrayContains("members", me).addSnapshotListener { snap, _ ->
             if (snap == null) return@addSnapshotListener
@@ -156,9 +202,18 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
                 if (snap == null) return@addSnapshotListener
                 val c = chats.firstOrNull { it.id == chatId } ?: return@addSnapshotListener
                 messages[chatId] = snap.documents.map { d ->
+                    val type = d.getString("type") ?: "text"
+                    var name = ""; var mime = ""; var size = 0L
+                    if (type != "text") d.getString("meta")?.let { m ->
+                        try {
+                            val o = JSONObject(crypto.decrypt(chatId, c.peerPub, m))
+                            name = o.optString("name"); mime = o.optString("mime"); size = o.optLong("size")
+                        } catch (_: Exception) { name = "🔒 Can't decrypt" }
+                    }
                     Msg(d.id, d.getString("from") ?: "", crypto.decrypt(chatId, c.peerPub, d.getString("cipher") ?: ""),
                         d.getTimestamp("ts")?.toDate()?.time ?: System.currentTimeMillis(),
-                        d.getBoolean("delivered") == true, d.metadata.hasPendingWrites())
+                        d.getBoolean("delivered") == true, d.metadata.hasPendingWrites(),
+                        type, name, mime, size, d.getString("path") ?: "")
                 }
                 for (ch in snap.documentChanges) {
                     if (ch.type != DocumentChange.Type.ADDED) continue
@@ -185,7 +240,130 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
         ref.update(mapOf("last" to cipher, "lastFrom" to me, "updated" to FieldValue.serverTimestamp()))
     }
 
+    fun peerOf(chatId: String): ChatItem? = chats.firstOrNull { it.id == chatId }
+
+    private fun displayName(uri: Uri): Pair<String, Long> {
+        var name = "file"; var size = -1L
+        try {
+            ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cur ->
+                if (cur.moveToFirst()) {
+                    cur.getString(0)?.let { name = it }
+                    if (!cur.isNull(1)) size = cur.getLong(1)
+                }
+            }
+        } catch (_: Exception) { }
+        return name to size
+    }
+
+    /** Scales an image down to max 1600px on the long side and re-encodes as JPEG 80 (also strips EXIF/location). */
+    private fun compressImage(uri: Uri): ByteArray? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 1600) sample *= 2
+        val bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample }) } ?: return null
+        val long = maxOf(bmp.width, bmp.height)
+        val scaled = if (long > 1600) Bitmap.createScaledBitmap(bmp, bmp.width * 1600 / long, bmp.height * 1600 / long, true) else bmp
+        val rotated = rotateFromExif(uri, scaled)
+        val out = ByteArrayOutputStream()
+        rotated.compress(Bitmap.CompressFormat.JPEG, 80, out)
+        return out.toByteArray()
+    }
+
+    private fun rotateFromExif(uri: Uri, b: Bitmap): Bitmap = try {
+        val deg = ctx.contentResolver.openInputStream(uri)?.use {
+            when (android.media.ExifInterface(it).getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, 1)) {
+                6 -> 90f; 3 -> 180f; 8 -> 270f; else -> 0f
+            }
+        } ?: 0f
+        if (deg == 0f) b else Bitmap.createBitmap(b, 0, 0, b.width, b.height, android.graphics.Matrix().apply { postRotate(deg) }, true)
+    } catch (_: Exception) { b }
+
+    /** Encrypts a photo or file on the phone, uploads only ciphertext, then posts the message. Returns an error text or null. */
+    suspend fun sendAttachment(chatId: String, uri: Uri, asImage: Boolean): String? {
+        val me = myUid.value ?: return "Not connected"
+        val c = peerOf(chatId) ?: return "Chat not ready yet"
+        if (c.peerPub.isBlank()) return "Chat not ready yet. Try again in a moment."
+        val st = storage ?: return "File sharing isn't set up on the server yet."
+        val d = db!!
+        val ref = d.collection("chats").document(chatId).collection("messages").document()
+        val msgId = ref.id
+        return try {
+            val (origName, origSize) = displayName(uri)
+            val mimeIn = ctx.contentResolver.getType(uri) ?: "application/octet-stream"
+            val isImage = asImage || (mimeIn.startsWith("image/") && mimeIn != "image/gif" && mimeIn != "image/svg+xml")
+            if (!isImage && origSize > MAX_ATTACHMENT_BYTES) return "That file is too big. The limit is 25 MB."
+            uploads[msgId] = Upload(msgId, chatId, origName, isImage, 0f)
+            val prepared = withContext(Dispatchers.IO) {
+                if (isImage) compressImage(uri)?.let { Triple(it, origName.substringBeforeLast('.') + ".jpg", "image/jpeg") }
+                else ctx.contentResolver.openInputStream(uri)?.use { ins ->
+                    val buf = ByteArrayOutputStream(); val chunk = ByteArray(64 * 1024); var total = 0L
+                    while (true) {
+                        val n = ins.read(chunk); if (n < 0) break
+                        total += n; if (total > MAX_ATTACHMENT_BYTES) return@use null
+                        buf.write(chunk, 0, n)
+                    }
+                    Triple(buf.toByteArray(), origName, mimeIn)
+                }
+            }
+            if (prepared == null) {
+                uploads.remove(msgId)
+                return if (isImage) "Couldn't read that photo. Try another one." else "That file is too big or couldn't be read. The limit is 25 MB."
+            }
+            val (bytes, name, mime) = prepared
+            if (bytes.size > MAX_ATTACHMENT_BYTES) { uploads.remove(msgId); return "That file is too big. The limit is 25 MB." }
+            val cipherBytes = withContext(Dispatchers.Default) { crypto.encryptBytes(chatId, c.peerPub, bytes) }
+            val path = "chats/$chatId/$msgId"
+            st.reference.child(path).putBytes(cipherBytes)
+                .addOnProgressListener { t ->
+                    val total = if (t.totalByteCount > 0) t.totalByteCount else cipherBytes.size.toLong()
+                    uploads[msgId]?.let { u -> uploads[msgId] = u.copy(progress = t.bytesTransferred.toFloat() / total) }
+                }.await()
+            val type = if (isImage) "image" else "file"
+            val meta = crypto.encrypt(chatId, c.peerPub, JSONObject().put("name", name).put("mime", mime).put("size", bytes.size.toLong()).toString())
+            val label = crypto.encrypt(chatId, c.peerPub, if (isImage) "📷 Photo" else "📎 $name")
+            // Keep a local ciphertext copy so the sender doesn't download it again.
+            withContext(Dispatchers.IO) { try { cacheFile(msgId).writeBytes(cipherBytes) } catch (_: Exception) { } }
+            ref.set(mapOf("from" to me, "cipher" to label, "type" to type, "meta" to meta, "path" to path,
+                "ts" to FieldValue.serverTimestamp(), "delivered" to false)).await()
+            d.collection("chats").document(chatId).update(mapOf("last" to label, "lastFrom" to me, "updated" to FieldValue.serverTimestamp()))
+            uploads.remove(msgId)
+            null
+        } catch (e: Exception) {
+            uploads.remove(msgId)
+            val t = (e.message ?: "").lowercase()
+            when {
+                "object does not exist" in t || "bucket" in t || "not found" in t -> "File sharing isn't set up on the server yet."
+                "permission" in t || "unauthorized" in t || "403" in t -> "The server refused the upload. Please update the app."
+                else -> friendly(e)
+            }
+        }
+    }
+
+    private fun cacheFile(msgId: String): File = File(File(ctx.cacheDir, "att").apply { mkdirs() }, "$msgId.enc")
+
+    /** Downloads (or reads cached) ciphertext and decrypts it in memory. Only ciphertext is ever cached on disk. */
+    suspend fun loadAttachment(chatId: String, m: Msg): ByteArray? {
+        val c = peerOf(chatId) ?: return null
+        if (m.path.isBlank() || c.peerPub.isBlank()) return null
+        return try {
+            val f = cacheFile(m.id)
+            val raw = if (f.exists()) withContext(Dispatchers.IO) { f.readBytes() } else {
+                val st = storage ?: return null
+                val b = st.reference.child(m.path).getBytes(MAX_ATTACHMENT_BYTES + 1024 * 1024).await()
+                withContext(Dispatchers.IO) { try { f.writeBytes(b) } catch (_: Exception) { } }
+                b
+            }
+            withContext(Dispatchers.Default) { crypto.decryptBytes(chatId, c.peerPub, raw) }
+        } catch (e: Exception) { null }
+    }
+
+    /** Temporary plaintext copies made for "Open with" are wiped whenever chats are hidden. */
+    fun clearOpenedFiles() { try { File(ctx.cacheDir, "open").deleteRecursively() } catch (_: Exception) { } }
+
     fun signOut() {
+        CallManager.detach()
         chatsReg?.remove(); msgRegs.values.forEach { it.remove() }; msgRegs.clear()
         chats.clear(); messages.clear(); myName.value = null; ready.value = false
         auth?.signOut(); myUid.value = null

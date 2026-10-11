@@ -17,10 +17,35 @@ service cloud.firestore {
                             && request.auth.uid in request.resource.data.members;
       match /messages/{m} {
         allow read: if request.auth != null && request.auth.uid in chatId.split('_');
+        // Text messages: {from, cipher, ts, delivered}. Attachments add {type, meta, path}.
+        // Old messages have no "type" and are treated as text.
         allow create: if request.auth != null && request.auth.uid in chatId.split('_')
-                      && request.resource.data.from == request.auth.uid;
+                      && request.resource.data.from == request.auth.uid
+                      && (!('type' in request.resource.data) || request.resource.data.type in ['text', 'image', 'file'])
+                      && (!('path' in request.resource.data) || request.resource.data.path == 'chats/' + chatId + '/' + m);
         allow update: if request.auth != null && request.auth.uid in chatId.split('_')
                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['delivered']);
+      }
+    }
+    // 1:1 call signaling (WebRTC offer/answer + ICE candidates). Only the two participants can see a call.
+    match /calls/{callId} {
+      allow read: if request.auth != null
+                  && (request.auth.uid == resource.data.caller || request.auth.uid == resource.data.callee);
+      allow create: if request.auth != null
+                    && request.resource.data.caller == request.auth.uid
+                    && request.resource.data.callee is string
+                    && request.resource.data.callee != request.auth.uid
+                    && request.resource.data.status == 'ringing';
+      allow update: if request.auth != null
+                    && (request.auth.uid == resource.data.caller || request.auth.uid == resource.data.callee)
+                    && request.resource.data.caller == resource.data.caller
+                    && request.resource.data.callee == resource.data.callee
+                    && request.resource.data.status in ['ringing', 'accepted', 'ended', 'declined'];
+      match /{side}/{cand} {
+        allow read, create: if request.auth != null
+                            && side in ['callerCandidates', 'calleeCandidates']
+                            && (request.auth.uid == get(/databases/$(db)/documents/calls/$(callId)).data.caller
+                                || request.auth.uid == get(/databases/$(db)/documents/calls/$(callId)).data.callee);
       }
     }
   }

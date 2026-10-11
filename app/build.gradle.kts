@@ -17,8 +17,8 @@ android {
         applicationId = "com.studynotes.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
         // Phones only (WebRTC ships large native libs per ABI; x86 emulators are skipped to keep the APK small)
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
@@ -58,7 +58,6 @@ dependencies {
     implementation(platform("com.google.firebase:firebase-bom:33.1.2"))
     implementation("com.google.firebase:firebase-auth-ktx")
     implementation("com.google.firebase:firebase-firestore-ktx")
-    implementation("com.google.firebase:firebase-storage-ktx")
     implementation("io.getstream:stream-webrtc-android:1.3.10")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
 }

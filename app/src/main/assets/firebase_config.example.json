@@ -3,7 +3,6 @@
   "appId": "PASTE_APP_ID (1:123:android:abc)",
   "projectId": "PASTE_PROJECT_ID",
   "messagingSenderId": "PASTE_PROJECT_NUMBER",
-  "storage_bucket": "PASTE_PROJECT_ID.firebasestorage.app",
   "turn_urls": "",
   "turn_username": "",
   "turn_credential": ""

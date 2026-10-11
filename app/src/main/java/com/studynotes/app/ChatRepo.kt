@@ -12,7 +12,7 @@ import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.Query
-import com.google.firebase.storage.FirebaseStorage
+import com.google.firebase.firestore.Blob
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -29,12 +29,21 @@ import java.io.File
 
 data class ChatItem(val id: String, val peerUid: String, val peerName: String, val peerPub: String,
                     val lastText: String, val updated: Long, val lastFrom: String)
-/** type: "text" (default, also for old docs without a type), "image" or "file". name/mime/size/path only for attachments. */
+/** type: "text" (default, also for old docs without a type), "image" or "file". name/mime/size/chunkCount only for attachments.
+ *  chunkCount > 0 means the encrypted bytes live in Firestore at messages/{id}/chunks/{0..n-1}. v1.1 messages that only have a
+ *  Cloud Storage "path" (never worked: no bucket) have chunkCount 0 and are shown as an unavailable attachment. */
 data class Msg(val id: String, val from: String, val text: String, val ts: Long, val delivered: Boolean, val pending: Boolean,
-               val type: String = "text", val name: String = "", val mime: String = "", val size: Long = 0, val path: String = "")
+               val type: String = "text", val name: String = "", val mime: String = "", val size: Long = 0,
+               val chunkCount: Int = 0, val cipherSize: Long = 0) {
+    val available: Boolean get() = chunkCount > 0
+}
 data class Upload(val id: String, val chatId: String, val name: String, val isImage: Boolean, val progress: Float)
 
-const val MAX_ATTACHMENT_BYTES = 25L * 1024 * 1024
+/** Attachments are stored in Firestore (free Spark plan, no Cloud Storage), so keep them small. */
+const val MAX_ATTACHMENT_BYTES = 5L * 1024 * 1024
+/** Raw ciphertext bytes per chunk document (Firestore's document limit is 1 MiB). */
+const val CHUNK_BYTES = 700 * 1024
+const val TOO_BIG = "That's too big to send. Photos and files can be up to 5 MB."
 
 class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val onIncoming: () -> Unit) {
     var configured = false; private set
@@ -47,10 +56,12 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
     val unread = mutableStateMapOf<String, Int>()
     var openChat: String? = null
     val uploads = mutableStateMapOf<String, Upload>()
+    /** Download progress (0..1) of attachments being fetched, keyed by message id. */
+    val downloads = mutableStateMapOf<String, Float>()
+    private val loadLocks = HashMap<String, Mutex>()
     /** WebRTC ICE servers: Google STUN plus optional TURN from firebase_config.json. */
     var iceConfig: List<Triple<List<String>, String, String>> = emptyList(); private set
     private var db: FirebaseFirestore? = null
-    private var storage: FirebaseStorage? = null
     internal val firestore: FirebaseFirestore? get() = db
     private val startLock = Mutex()
     private var auth: FirebaseAuth? = null
@@ -64,21 +75,13 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
             val key = j.optString("apiKey")
             if (key.isNotBlank() && !key.startsWith("PASTE")) {
                 val opts = FirebaseOptions.Builder().setApiKey(key).setApplicationId(j.getString("appId"))
-                    .setProjectId(j.getString("projectId")).setGcmSenderId(j.optString("messagingSenderId"))
-                    .setStorageBucket(bucketFrom(j)).build()
+                    .setProjectId(j.getString("projectId")).setGcmSenderId(j.optString("messagingSenderId")).build()
                 val app = if (FirebaseApp.getApps(ctx).isEmpty()) FirebaseApp.initializeApp(ctx, opts) else FirebaseApp.getInstance()
                 db = FirebaseFirestore.getInstance(app); auth = FirebaseAuth.getInstance(app)
-                storage = try { FirebaseStorage.getInstance(app) } catch (_: Exception) { null }
                 iceConfig = iceFrom(j)
                 configured = true
             }
         } catch (e: Exception) { error.value = "The app couldn't load its server settings. Please reinstall the latest version." }
-    }
-
-    /** Bucket: "storage_bucket" key, then legacy "storageBucket", else the default <projectId>.firebasestorage.app. */
-    private fun bucketFrom(j: JSONObject): String {
-        val b = j.optString("storage_bucket").ifBlank { j.optString("storageBucket") }.trim()
-        return b.removePrefix("gs://").ifBlank { j.getString("projectId") + ".firebasestorage.app" }
     }
 
     private fun iceFrom(j: JSONObject): List<Triple<List<String>, String, String>> {
@@ -213,7 +216,7 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
                     Msg(d.id, d.getString("from") ?: "", crypto.decrypt(chatId, c.peerPub, d.getString("cipher") ?: ""),
                         d.getTimestamp("ts")?.toDate()?.time ?: System.currentTimeMillis(),
                         d.getBoolean("delivered") == true, d.metadata.hasPendingWrites(),
-                        type, name, mime, size, d.getString("path") ?: "")
+                        type, name, mime, size, (d.getLong("chunkCount") ?: 0L).toInt(), d.getLong("size") ?: 0L)
                 }
                 for (ch in snap.documentChanges) {
                     if (ch.type != DocumentChange.Type.ADDED) continue
@@ -280,20 +283,20 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
         if (deg == 0f) b else Bitmap.createBitmap(b, 0, 0, b.width, b.height, android.graphics.Matrix().apply { postRotate(deg) }, true)
     } catch (_: Exception) { b }
 
-    /** Encrypts a photo or file on the phone, uploads only ciphertext, then posts the message. Returns an error text or null. */
+    /** Encrypts a photo or file on the phone, stores only ciphertext in Firestore (as Blob chunks), then posts the message.
+     *  Returns an error text or null. */
     suspend fun sendAttachment(chatId: String, uri: Uri, asImage: Boolean): String? {
         val me = myUid.value ?: return "Not connected"
         val c = peerOf(chatId) ?: return "Chat not ready yet"
         if (c.peerPub.isBlank()) return "Chat not ready yet. Try again in a moment."
-        val st = storage ?: return "File sharing isn't set up on the server yet."
-        val d = db!!
+        val d = db ?: return "Not connected"
         val ref = d.collection("chats").document(chatId).collection("messages").document()
         val msgId = ref.id
         return try {
             val (origName, origSize) = displayName(uri)
             val mimeIn = ctx.contentResolver.getType(uri) ?: "application/octet-stream"
             val isImage = asImage || (mimeIn.startsWith("image/") && mimeIn != "image/gif" && mimeIn != "image/svg+xml")
-            if (!isImage && origSize > MAX_ATTACHMENT_BYTES) return "That file is too big. The limit is 25 MB."
+            if (!isImage && origSize > MAX_ATTACHMENT_BYTES) return TOO_BIG
             uploads[msgId] = Upload(msgId, chatId, origName, isImage, 0f)
             val prepared = withContext(Dispatchers.IO) {
                 if (isImage) compressImage(uri)?.let { Triple(it, origName.substringBeforeLast('.') + ".jpg", "image/jpeg") }
@@ -309,33 +312,37 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
             }
             if (prepared == null) {
                 uploads.remove(msgId)
-                return if (isImage) "Couldn't read that photo. Try another one." else "That file is too big or couldn't be read. The limit is 25 MB."
+                return if (isImage) "Couldn't read that photo. Try another one." else "That file is too big or couldn't be read. Photos and files can be up to 5 MB."
             }
             val (bytes, name, mime) = prepared
-            if (bytes.size > MAX_ATTACHMENT_BYTES) { uploads.remove(msgId); return "That file is too big. The limit is 25 MB." }
+            if (bytes.size > MAX_ATTACHMENT_BYTES) { uploads.remove(msgId); return TOO_BIG }
             val cipherBytes = withContext(Dispatchers.Default) { crypto.encryptBytes(chatId, c.peerPub, bytes) }
-            val path = "chats/$chatId/$msgId"
-            st.reference.child(path).putBytes(cipherBytes)
-                .addOnProgressListener { t ->
-                    val total = if (t.totalByteCount > 0) t.totalByteCount else cipherBytes.size.toLong()
-                    uploads[msgId]?.let { u -> uploads[msgId] = u.copy(progress = t.bytesTransferred.toFloat() / total) }
-                }.await()
+            val count = (cipherBytes.size + CHUNK_BYTES - 1) / CHUNK_BYTES
+            // 1) Chunks first, one write per chunk so progress moves per chunk. Each is ~700 KB, under the 1 MiB doc limit.
+            val chunks = ref.collection("chunks")
+            for (i in 0 until count) {
+                val part = cipherBytes.copyOfRange(i * CHUNK_BYTES, minOf(cipherBytes.size, (i + 1) * CHUNK_BYTES))
+                d.batch().set(chunks.document(i.toString()), mapOf("idx" to i, "data" to Blob.fromBytes(part))).commit().await()
+                uploads[msgId]?.let { u -> uploads[msgId] = u.copy(progress = (i + 1).toFloat() / count) }
+            }
+            // 2) Then the message itself, which tells the receiver how many chunks to read.
             val type = if (isImage) "image" else "file"
             val meta = crypto.encrypt(chatId, c.peerPub, JSONObject().put("name", name).put("mime", mime).put("size", bytes.size.toLong()).toString())
             val label = crypto.encrypt(chatId, c.peerPub, if (isImage) "📷 Photo" else "📎 $name")
             // Keep a local ciphertext copy so the sender doesn't download it again.
             withContext(Dispatchers.IO) { try { cacheFile(msgId).writeBytes(cipherBytes) } catch (_: Exception) { } }
-            ref.set(mapOf("from" to me, "cipher" to label, "type" to type, "meta" to meta, "path" to path,
+            ref.set(mapOf("from" to me, "cipher" to label, "type" to type, "meta" to meta,
+                "chunkCount" to count, "size" to cipherBytes.size.toLong(),
                 "ts" to FieldValue.serverTimestamp(), "delivered" to false)).await()
             d.collection("chats").document(chatId).update(mapOf("last" to label, "lastFrom" to me, "updated" to FieldValue.serverTimestamp()))
             uploads.remove(msgId)
             null
         } catch (e: Exception) {
             uploads.remove(msgId)
-            val t = (e.message ?: "").lowercase()
+            val t = (e.message + " " + (e.cause?.message ?: "")).lowercase()
             when {
-                "object does not exist" in t || "bucket" in t || "not found" in t -> "File sharing isn't set up on the server yet."
-                "permission" in t || "unauthorized" in t || "403" in t -> "The server refused the upload. Please update the app."
+                "too large" in t || "exceeds the maximum" in t || "invalid_argument" in t -> TOO_BIG
+                "permission" in t || "denied" in t -> "The server refused the upload. Make sure the latest Firestore rules are published."
                 else -> friendly(e)
             }
         }
@@ -343,17 +350,36 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
 
     private fun cacheFile(msgId: String): File = File(File(ctx.cacheDir, "att").apply { mkdirs() }, "$msgId.enc")
 
-    /** Downloads (or reads cached) ciphertext and decrypts it in memory. Only ciphertext is ever cached on disk. */
+    /** Reads cached ciphertext, or fetches the Firestore chunks in order, then decrypts in memory.
+     *  Only ciphertext is ever cached on disk. Returns null if unavailable or on any failure. */
     suspend fun loadAttachment(chatId: String, m: Msg): ByteArray? {
         val c = peerOf(chatId) ?: return null
-        if (m.path.isBlank() || c.peerPub.isBlank()) return null
+        if (c.peerPub.isBlank()) return null
+        val f = cacheFile(m.id)
+        if (!m.available && !f.exists()) return null
+        val lock = synchronized(loadLocks) { loadLocks.getOrPut(m.id) { Mutex() } }
         return try {
-            val f = cacheFile(m.id)
-            val raw = if (f.exists()) withContext(Dispatchers.IO) { f.readBytes() } else {
-                val st = storage ?: return null
-                val b = st.reference.child(m.path).getBytes(MAX_ATTACHMENT_BYTES + 1024 * 1024).await()
-                withContext(Dispatchers.IO) { try { f.writeBytes(b) } catch (_: Exception) { } }
-                b
+            val raw = lock.withLock {
+                if (f.exists()) withContext(Dispatchers.IO) { f.readBytes() } else {
+                    val d = db ?: return null
+                    val chunks = d.collection("chats").document(chatId).collection("messages").document(m.id).collection("chunks")
+                    val out = ByteArrayOutputStream(if (m.cipherSize in 1..(MAX_ATTACHMENT_BYTES * 2)) m.cipherSize.toInt() else 64 * 1024)
+                    downloads[m.id] = 0f
+                    try {
+                        // Chunk doc ids are their index, so read 0..n-1 in order (same as ordering by idx) and report progress per chunk.
+                        for (i in 0 until m.chunkCount) {
+                            val doc = chunks.document(i.toString()).get().await()
+                            val blob = doc.getBlob("data") ?: return null
+                            if ((doc.getLong("idx") ?: i.toLong()) != i.toLong()) return null
+                            out.write(blob.toBytes())
+                            downloads[m.id] = (i + 1).toFloat() / m.chunkCount
+                        }
+                    } finally { downloads.remove(m.id) }
+                    val b = out.toByteArray()
+                    if (m.cipherSize > 0 && b.size.toLong() != m.cipherSize) return null
+                    withContext(Dispatchers.IO) { try { f.writeBytes(b) } catch (_: Exception) { } }
+                    b
+                }
             }
             withContext(Dispatchers.Default) { crypto.decryptBytes(chatId, c.peerPub, raw) }
         } catch (e: Exception) { null }

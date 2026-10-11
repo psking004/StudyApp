@@ -38,6 +38,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
@@ -240,7 +241,7 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                     Column(Modifier.widthIn(max = 280.dp).background(if (mine) OutBubble else Color.White, RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 6.dp)) {
                         when (m.type) {
                             "image" -> ImageThumb(repo, chatId, m) { viewing = m }
-                            "file" -> FileRow(m) { fileAction = m }
+                            "file" -> FileRow(m, repo.downloads[m.id]) { if (m.available) fileAction = m else toast("This file isn't available. It was sent from an older version of the app.") }
                             else -> Text(m.text, fontSize = 15.sp)
                         }
                         Row(Modifier.align(Alignment.End), verticalAlignment = Alignment.CenterVertically) {
@@ -321,7 +322,8 @@ private fun decodeSampled(bytes: ByteArray, maxSide: Int): Bitmap? {
 private fun ImageThumb(repo: ChatRepo, chatId: String, m: Msg, onOpen: () -> Unit) {
     var bmp by remember(m.id) { mutableStateOf<Bitmap?>(null) }
     var failed by remember(m.id) { mutableStateOf(false) }
-    LaunchedEffect(m.id, m.path) {
+    val progress = repo.downloads[m.id]
+    LaunchedEffect(m.id, m.chunkCount) {
         val b = repo.loadAttachment(chatId, m)
         if (b == null) failed = true else bmp = withContext(Dispatchers.Default) { decodeSampled(b, 800) }.also { if (it == null) failed = true }
     }
@@ -329,7 +331,12 @@ private fun ImageThumb(repo: ChatRepo, chatId: String, m: Msg, onOpen: () -> Uni
     if (b != null) Image(b.asImageBitmap(), "Photo", contentScale = ContentScale.Crop,
         modifier = Modifier.width(240.dp).heightIn(max = 320.dp).aspectRatio(b.width.toFloat() / b.height.coerceAtLeast(1)).clip(RoundedCornerShape(8.dp)).clickable { onOpen() })
     else Box(Modifier.size(240.dp, 180.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFFDFE5E7)), contentAlignment = Alignment.Center) {
-        if (failed) Text("📷 Photo couldn't load", color = Color.Gray, fontSize = 13.sp) else CircularProgressIndicator(color = WaGreen, modifier = Modifier.size(28.dp))
+        when {
+            failed && !m.available -> Text("📷 Photo unavailable\n(sent from an older version)", color = Color.Gray, fontSize = 13.sp, textAlign = TextAlign.Center)
+            failed -> Text("📷 Photo couldn't load", color = Color.Gray, fontSize = 13.sp)
+            progress != null && progress > 0f -> CircularProgressIndicator(progress = { progress }, color = WaGreen, modifier = Modifier.size(28.dp))
+            else -> CircularProgressIndicator(color = WaGreen, modifier = Modifier.size(28.dp))
+        }
     }
 }
 
@@ -348,14 +355,19 @@ private fun FullImage(repo: ChatRepo, chatId: String, m: Msg, onClose: () -> Uni
 }
 
 @Composable
-private fun FileRow(m: Msg, onClick: () -> Unit) {
+private fun FileRow(m: Msg, progress: Float?, onClick: () -> Unit) {
     Row(Modifier.widthIn(min = 200.dp).clip(RoundedCornerShape(8.dp)).background(Color(0x14000000)).clickable { onClick() }.padding(10.dp),
         verticalAlignment = Alignment.CenterVertically) {
         Icon(Icons.Default.InsertDriveFile, null, tint = WaGreen, modifier = Modifier.size(32.dp))
         Spacer(Modifier.width(8.dp))
         Column(Modifier.weight(1f, fill = false)) {
             Text(m.name.ifBlank { "File" }, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Text(sizeText(m.size) + " · tap to save or open", fontSize = 11.sp, color = Color.Gray)
+            Text(when {
+                progress != null -> "🔒 Downloading " + (progress * 100).toInt() + "%"
+                !m.available -> "Unavailable (sent from an older version)"
+                else -> sizeText(m.size) + " · tap to save or open"
+            }, fontSize = 11.sp, color = Color.Gray)
+            if (progress != null) LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth().padding(top = 4.dp), color = WaGreen)
         }
     }
 }

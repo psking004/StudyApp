@@ -17,14 +17,27 @@ service cloud.firestore {
                             && request.auth.uid in request.resource.data.members;
       match /messages/{m} {
         allow read: if request.auth != null && request.auth.uid in chatId.split('_');
-        // Text messages: {from, cipher, ts, delivered}. Attachments add {type, meta, path}.
-        // Old messages have no "type" and are treated as text.
+        // Text messages: {from, cipher, ts, delivered}. Attachments (v1.2) add {type, meta, chunkCount, size};
+        // the encrypted bytes live in the chunks subcollection below. Old messages have no "type" and are treated as text.
+        // v1.1 "path" (Cloud Storage) is still accepted for old clients but is no longer written.
         allow create: if request.auth != null && request.auth.uid in chatId.split('_')
                       && request.resource.data.from == request.auth.uid
                       && (!('type' in request.resource.data) || request.resource.data.type in ['text', 'image', 'file'])
-                      && (!('path' in request.resource.data) || request.resource.data.path == 'chats/' + chatId + '/' + m);
+                      && (!('path' in request.resource.data) || request.resource.data.path == 'chats/' + chatId + '/' + m)
+                      && (!('chunkCount' in request.resource.data) || (request.resource.data.chunkCount is int
+                          && request.resource.data.chunkCount > 0 && request.resource.data.chunkCount <= 10))
+                      && (!('size' in request.resource.data) || (request.resource.data.size is int
+                          && request.resource.data.size > 0 && request.resource.data.size <= 6000000));
         allow update: if request.auth != null && request.auth.uid in chatId.split('_')
                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['delivered']);
+        // Encrypted attachment bytes (AES-GCM ciphertext), split into ~700 KB chunks: {idx, data (bytes)}.
+        match /chunks/{c} {
+          allow read: if request.auth != null && request.auth.uid in chatId.split('_');
+          allow create: if request.auth != null && request.auth.uid in chatId.split('_')
+                        && request.resource.data.data is bytes
+                        && request.resource.data.data.size() < 1000000
+                        && request.resource.data.idx is int;
+        }
       }
     }
     // 1:1 call signaling (WebRTC offer/answer + ICE candidates). Only the two participants can see a call.

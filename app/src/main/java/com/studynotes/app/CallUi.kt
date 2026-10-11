@@ -33,9 +33,12 @@ fun callPermissions(video: Boolean): Array<String> =
 
 fun hasPermissions(ctx: Context, perms: Array<String>) = perms.all { ContextCompat.checkSelfPermission(ctx, it) == PackageManager.PERMISSION_GRANTED }
 
-/** Full-screen overlay shown above everything while a call is ringing or in progress. */
+/**
+ * Full-screen call screen. v1.4: MainActivity only composes this while the chat section is unlocked. Back relocks
+ * the app (hides the chats and this screen) without hanging up or declining; the call comes back after unlocking.
+ */
 @Composable
-fun CallOverlay() {
+fun CallOverlay(onHide: () -> Unit) {
     val s = CallManager.state.value ?: return
     val ctx = LocalContext.current
     var err by remember { mutableStateOf<String?>(null) }
@@ -44,7 +47,8 @@ fun CallOverlay() {
         if (res.values.all { it }) CallManager.accept { err = it }
         else err = if (s.video) "Allow microphone and camera to answer video calls." else "Allow the microphone to answer calls."
     }
-    BackHandler { /* keep the call screen up; use the buttons */ }
+    DisposableEffect(Unit) { CallManager.callUiVisible = true; onDispose { CallManager.callUiVisible = false } }
+    BackHandler { onHide() } // hide with the chat section; the call itself keeps going (or keeps ringing)
     Box(Modifier.fillMaxSize().background(Color(0xFF0B141A))) {
         val remote = CallManager.remoteVideo.value
         val local = CallManager.localVideo.value

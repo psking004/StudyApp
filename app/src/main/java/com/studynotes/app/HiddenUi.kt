@@ -132,9 +132,21 @@ private fun ChatList(repo: ChatRepo, onOpen: (String) -> Unit, onNew: () -> Unit
         floatingActionButton = { FloatingActionButton(onClick = onNew, containerColor = Color(0xFF25D366)) { Icon(Icons.Default.Chat, "New chat", tint = Color.White) } },
         containerColor = Color.White
     ) { pad ->
-        if (visible.isEmpty())
+        val missed = CallManager.missed.value
+        if (visible.isEmpty() && missed.isEmpty())
             Box(Modifier.padding(pad).fillMaxSize(), contentAlignment = Alignment.Center) { Text("No chats yet. Tap the button to message a username.", color = Color.Gray, modifier = Modifier.padding(32.dp)) }
         LazyColumn(Modifier.padding(pad)) {
+            // v1.4: quiet missed-call entries for calls that rang and ended while chats were locked (memory only).
+            items(missed, key = { "missed_" + it.callId }) { m ->
+                Row(Modifier.fillMaxWidth().background(Color(0xFFF7F7F7)).padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Icon(if (m.video) Icons.Default.Videocam else Icons.Default.Call, null, tint = Color(0xFFE53935), modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Text("Missed ${if (m.video) "video" else "voice"} call from @${m.peerName} · ${time(m.at)}", color = Color.Gray, fontSize = 13.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { CallManager.dismissMissed(m.callId) }) { Icon(Icons.Default.Close, "Dismiss", tint = Color.Gray, modifier = Modifier.size(18.dp)) }
+                }
+            }
             items(visible, key = { it.id }) { c ->
                 val unread = repo.unread[c.id] ?: 0
                 Row(Modifier.fillMaxWidth().combinedClickable(onClick = { if (deleting != c.id) onOpen(c.id) }, onLongClick = { if (deleting == null) chatMenu = c })
@@ -537,6 +549,7 @@ private fun Settings(repo: ChatRepo, secret: SecretStore, onBack: () -> Unit) {
                 confirmClear = false; clearing = true
                 scope.launch {
                     val r = repo.clearCallHistory(); clearing = false
+                    CallManager.clearMissed()
                     Toast.makeText(ctx, r.fold({ if (it == 0) "No call history to clear" else "Call history cleared" }, { it.message ?: "Couldn't clear call history" }), Toast.LENGTH_LONG).show()
                 }
             }) { Text("Clear", color = Color(0xFFD32F2F)) }

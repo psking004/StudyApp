@@ -59,7 +59,7 @@ class MainActivity : ComponentActivity() {
                         delay(5000)
                         // Idle timer is paused during a call so an active call is never hidden or cut off.
                         if (CallManager.state.value != null) { lastTouch = System.currentTimeMillis(); continue }
-                        if (System.currentTimeMillis() - lastTouch > 60_000) { repo.clearOpenedFiles(); screen.value = Screen.Notes }
+                        if (System.currentTimeMillis() - lastTouch > 60_000) lock()
                     }
                 }
                 Box(Modifier.fillMaxSize()) {
@@ -71,13 +71,24 @@ class MainActivity : ComponentActivity() {
                         BackHandler { screen.value = Screen.Notes }
                         NoteEditor(notes, cur.id) { screen.value = Screen.Notes }
                     }
-                    Screen.Hidden -> HiddenApp(repo, secret, onHide = { repo.openChat = null; repo.clearOpenedFiles(); screen.value = Screen.Notes })
+                    Screen.Hidden -> HiddenApp(repo, secret, onHide = { lock() })
                 }
-                CallOverlay()
+                // v1.4: calls never show while the chat section is locked. A ringing call waits in the background
+                // (no screen, no sound) and its Accept/Decline screen appears once the passcode unlocks the chats, if it
+                // is still ringing. A connected call keeps running while locked; its screen hides and returns on unlock.
+                val call = CallManager.state.value
+                if (s is Screen.Hidden && call != null) {
+                    if (call.phase != CallPhase.Ended) CallManager.surfacedCallId = call.callId
+                    // A call that ended while locked never flashes its "ended" banner after unlocking.
+                    if (call.phase != CallPhase.Ended || CallManager.surfacedCallId == call.callId) CallOverlay(onHide = { lock() })
+                }
                 }
             }
         }
     }
+
+    /** Relock: back to the notes screen, chats and call screen hidden. Never hangs up or declines a call. */
+    private fun lock() { repo.openChat = null; repo.clearOpenedFiles(); screen.value = Screen.Notes }
 
     override fun onUserInteraction() { super.onUserInteraction(); lastTouch = System.currentTimeMillis() }
     override fun onStart() {

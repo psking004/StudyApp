@@ -32,6 +32,9 @@ import org.webrtc.audio.JavaAudioDeviceModule
 
 enum class CallPhase { Outgoing, Incoming, Connecting, Connected, Ended }
 
+/** A quiet, in-memory-only record of a call that rang and ended while the chat section was locked (v1.4). */
+data class MissedCall(val callId: String, val peerName: String, val video: Boolean, val at: Long)
+
 data class CallState(
     val callId: String, val peerUid: String, val peerName: String, val video: Boolean, val incoming: Boolean,
     val phase: CallPhase, val muted: Boolean = false, val speaker: Boolean = false, val cameraOn: Boolean = true,
@@ -54,6 +57,19 @@ object CallManager {
     var onRingingStopped: (() -> Unit)? = null
 
     val active: Boolean get() = state.value?.let { it.phase != CallPhase.Ended } == true
+
+    /**
+     * v1.4: the call screen is only ever drawn while the chat section is unlocked. This remembers the id of the call
+     * whose screen was actually shown, so a call that rang and ended while locked never flashes an "ended" banner
+     * after unlocking; it becomes a quiet [missed] entry instead. Main thread only.
+     */
+    var surfacedCallId: String? = null
+    /** True while the call screen is actually on screen (set by CallOverlay). Main thread only. */
+    var callUiVisible = false
+    /** Calls that rang and ended while locked. Memory only: never written to disk or Firestore, gone when the app process dies. */
+    val missed = mutableStateOf<List<MissedCall>>(emptyList())
+    fun dismissMissed(callId: String) { missed.value = missed.value.filterNot { it.callId == callId } }
+    fun clearMissed() { missed.value = emptyList() }
 
     private val main = Handler(Looper.getMainLooper())
     private lateinit var appCtx: Context
@@ -114,6 +130,7 @@ object CallManager {
 
     fun detach() {
         if (active) hangup()
+        clearMissed()
         incomingReg?.remove(); incomingReg = null
     }
 
@@ -353,6 +370,13 @@ object CallManager {
     private fun endLocal(reason: String, writeStatus: Boolean) = ui {
         val s = state.value ?: return@ui
         if (s.phase == CallPhase.Ended) return@ui
+        if (!callUiVisible) {
+            // Ended while the call screen was hidden (chat section locked): never show an "ended" banner for it later,
+            // and if it was still ringing, keep a quiet missed-call entry inside the chat section instead.
+            if (surfacedCallId == s.callId) surfacedCallId = null
+            if (s.incoming && s.phase == CallPhase.Incoming && reason != "Declined")
+                missed.value = (listOf(MissedCall(s.callId, s.peerName, s.video, System.currentTimeMillis())) + missed.value).take(20)
+        }
         cancelTimeout()
         onRingingStopped?.invoke()
         if (writeStatus) repo?.firestore?.collection("calls")?.document(s.callId)?.update("status", "ended")

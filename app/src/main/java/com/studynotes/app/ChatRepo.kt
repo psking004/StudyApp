@@ -8,6 +8,7 @@ import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.DocumentChange
+import com.google.firebase.firestore.DocumentReference
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
@@ -17,7 +18,11 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
@@ -44,6 +49,8 @@ const val MAX_ATTACHMENT_BYTES = 5L * 1024 * 1024
 /** Raw ciphertext bytes per chunk document (Firestore's document limit is 1 MiB). */
 const val CHUNK_BYTES = 700 * 1024
 const val TOO_BIG = "That's too big to send. Photos and files can be up to 5 MB."
+/** Firestore allows 500 writes per batch; stay well under it. */
+const val DELETE_BATCH = 450
 
 class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val onIncoming: () -> Unit) {
     var configured = false; private set
@@ -67,7 +74,19 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
     private var auth: FirebaseAuth? = null
     private var chatsReg: ListenerRegistration? = null
     private val msgRegs = HashMap<String, ListenerRegistration>()
+    private val pubRegs = HashMap<String, ListenerRegistration>()
     private val startedAt = System.currentTimeMillis()
+    /** Background work that must outlive a screen (call-doc cleanup after a call ends). */
+    private val bg = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    // ---- "Delete for me": stored only on this phone, never sent anywhere ----
+    private val privacy = ctx.getSharedPreferences("privacy", Context.MODE_PRIVATE)
+    /** chatId -> ids of messages hidden on this phone. */
+    val hiddenMsgs = mutableStateMapOf<String, Set<String>>()
+    /** chatId -> messages with a server time at or before this are hidden on this phone (set by "Delete chat for me"). */
+    val chatCut = mutableStateMapOf<String, Long>()
+    /** chatId -> chat is hidden from the list until its "updated" time moves past this (i.e. a new message arrives). */
+    val chatHide = mutableStateMapOf<String, Long>()
 
     init {
         try {
@@ -82,6 +101,16 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
                 configured = true
             }
         } catch (e: Exception) { error.value = "The app couldn't load its server settings. Please reinstall the latest version." }
+    }
+
+    init {
+        for ((k, v) in privacy.all) {
+            when {
+                k.startsWith("hm_") -> (v as? Set<*>)?.let { set -> hiddenMsgs[k.removePrefix("hm_")] = set.map { it.toString() }.toSet() }
+                k.startsWith("cut_") -> (v as? Long)?.let { chatCut[k.removePrefix("cut_")] = it }
+                k.startsWith("hide_") -> (v as? Long)?.let { chatHide[k.removePrefix("hide_")] = it }
+            }
+        }
     }
 
     private fun iceFrom(j: JSONObject): List<Triple<List<String>, String, String>> {
@@ -148,6 +177,8 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
                 ref.set(mapOf("members" to listOf(me, peer), "names" to mapOf(me to myName.value, peer to name),
                     "updated" to FieldValue.serverTimestamp(), "lastFrom" to "", "last" to "")).await()
             }
+            // Starting a chat you had deleted "for me" shows it again (older messages stay hidden on this phone).
+            unhideChat(id)
             id
         } catch (e: Exception) { "!" + friendly(e) }
     }
@@ -181,12 +212,20 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
                     d.getString("lastFrom") ?: "")
             }.sortedByDescending { it.updated }
             chats.clear(); chats.addAll(list)
+            // A chat hidden with "Delete for me" comes back as soon as a newer message moves its "updated" time.
+            list.forEach { c -> chatHide[c.id]?.let { h -> if (c.updated > h) unhideChat(c.id) } }
+            // Chats deleted for everyone (by either person) disappear: stop listening and drop cached ciphertext.
+            if (!snap.metadata.isFromCache) {
+                val ids = list.map { it.id }.toSet()
+                (msgRegs.keys + pubRegs.keys + messages.keys).filter { it !in ids }.toSet().forEach { forgetChatLocally(it, clearPrefs = false) }
+            }
             list.forEach { c -> if (c.peerPub.isBlank()) fetchPub(c.id, c.peerUid) else listenMessages(c.id) }
         }
     }
 
     private fun fetchPub(chatId: String, peerUid: String) {
-        db!!.collection("users").document(peerUid).addSnapshotListener { d, _ ->
+        if (pubRegs.containsKey(chatId)) return
+        pubRegs[chatId] = db!!.collection("users").document(peerUid).addSnapshotListener { d, _ ->
             val pub = d?.getString("pub") ?: return@addSnapshotListener
             val i = chats.indexOfFirst { it.id == chatId }
             if (i >= 0 && chats[i].peerPub != pub) { chats[i] = chats[i].copy(peerPub = pub); msgRegs.remove(chatId)?.remove(); listenMessages(chatId) }
@@ -219,6 +258,9 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
                         type, name, mime, size, (d.getLong("chunkCount") ?: 0L).toInt(), d.getLong("size") ?: 0L)
                 }
                 for (ch in snap.documentChanges) {
+                    // Deleted for everyone (by the sender): drop any cached ciphertext of it on this phone too.
+                    // (A message that merely scrolls out of the 300-message window also lands here; it is just re-downloaded if opened.)
+                    if (ch.type == DocumentChange.Type.REMOVED) { deleteCached(listOf(ch.document.id)); continue }
                     if (ch.type != DocumentChange.Type.ADDED) continue
                     val d = ch.document
                     if (d.getString("from") == me) continue
@@ -385,12 +427,171 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
         } catch (e: Exception) { null }
     }
 
+    // ===================== Deleting (v1.3) =====================
+
+    /** Messages shown on this phone: everything minus "Delete for me" hides. */
+    fun visibleMessages(chatId: String): List<Msg> {
+        val all = messages[chatId] ?: return emptyList()
+        val hidden = hiddenMsgs[chatId] ?: emptySet()
+        val cut = chatCut[chatId] ?: 0L
+        return all.filter { it.id !in hidden && (it.pending || it.ts > cut) }
+    }
+
+    /** Chats shown in the list on this phone. */
+    fun visibleChats(): List<ChatItem> = chats.filter { c -> chatHide[c.id]?.let { c.updated > it } ?: true }
+
+    /** Chat-list preview that respects local hides. Returns (text, sentByMe). */
+    fun previewOf(c: ChatItem): Pair<String, Boolean> {
+        if (messages[c.id] != null) {
+            val m = visibleMessages(c.id).lastOrNull() ?: return "" to false
+            return m.text to (m.from == myUid.value)
+        }
+        if (chatCut.containsKey(c.id)) return "" to false
+        return preview(c) to (c.lastFrom == myUid.value)
+    }
+
+    private fun unhideChat(chatId: String) {
+        if (chatHide.remove(chatId) != null) privacy.edit().remove("hide_$chatId").apply()
+    }
+
+    private fun deleteCached(ids: Collection<String>) {
+        if (ids.isEmpty()) return
+        bg.launch(Dispatchers.IO) { ids.forEach { try { cacheFile(it).delete() } catch (_: Exception) { } } }
+    }
+
+    /** Stops listening to a chat and drops everything this phone holds for it. */
+    private fun forgetChatLocally(chatId: String, clearPrefs: Boolean) {
+        msgRegs.remove(chatId)?.remove()
+        pubRegs.remove(chatId)?.remove()
+        deleteCached(messages[chatId]?.map { it.id } ?: emptyList())
+        messages.remove(chatId); unread.remove(chatId)
+        if (clearPrefs) {
+            hiddenMsgs.remove(chatId); chatCut.remove(chatId); chatHide.remove(chatId)
+            privacy.edit().remove("hm_$chatId").remove("cut_$chatId").remove("hide_$chatId").apply()
+        }
+    }
+
+    /** "Delete for me": hides one message on this phone only and removes its cached file. */
+    fun deleteMessageForMe(chatId: String, m: Msg) {
+        val set = (hiddenMsgs[chatId] ?: emptySet()) + m.id
+        hiddenMsgs[chatId] = set
+        privacy.edit().putStringSet("hm_$chatId", HashSet(set)).apply()
+        deleteCached(listOf(m.id))
+    }
+
+    private suspend fun commitDeletes(d: FirebaseFirestore, refs: List<DocumentReference>) {
+        for (part in refs.chunked(DELETE_BATCH)) {
+            val b = d.batch()
+            part.forEach { b.delete(it) }
+            b.commit().await()
+        }
+    }
+
+    private fun deleteError(e: Throwable): String {
+        val t = (e.message + " " + (e.cause?.message ?: "")).lowercase()
+        return if ("permission" in t || "denied" in t) "The server refused the delete. Make sure the latest Firestore rules (v1.3) are published."
+        else friendly(e)
+    }
+
+    /** "Delete for everyone" (own messages only): deletes the attachment chunks, the message doc and the local cached file.
+     *  The other phone's message listener drops it live. Returns an error text or null. */
+    suspend fun deleteMessageForEveryone(chatId: String, m: Msg): String? {
+        val me = myUid.value ?: return "Not connected"
+        if (m.from != me) return "You can only delete your own messages for everyone."
+        val d = db ?: return "Not connected"
+        val chatRef = d.collection("chats").document(chatId)
+        val ref = chatRef.collection("messages").document(m.id)
+        val wasLast = messages[chatId]?.lastOrNull()?.id == m.id
+        return try {
+            val chunks = if (m.type != "text" || m.chunkCount > 0) ref.collection("chunks").get().await().documents.map { it.reference } else emptyList()
+            commitDeletes(d, chunks + ref)
+            deleteCached(listOf(m.id))
+            if (wasLast) try {
+                // Point the chat preview at the previous message so the deleted text doesn't linger there.
+                val prev = chatRef.collection("messages").orderBy("ts", Query.Direction.DESCENDING).limit(1).get().await().documents.firstOrNull()
+                chatRef.update(mapOf("last" to (prev?.getString("cipher") ?: ""), "lastFrom" to (prev?.getString("from") ?: ""))).await()
+            } catch (_: Exception) { }
+            null
+        } catch (e: Exception) { deleteError(e) }
+    }
+
+    /** "Delete chat for me": hides the chat and its current messages on this phone until a new message arrives. */
+    fun deleteChatForMe(chatId: String) {
+        val c = chats.firstOrNull { it.id == chatId }
+        val cut = maxOf(c?.updated ?: 0L, messages[chatId]?.maxOfOrNull { it.ts } ?: 0L)
+        chatCut[chatId] = cut; chatHide[chatId] = cut
+        privacy.edit().putLong("cut_$chatId", cut).putLong("hide_$chatId", cut).remove("hm_$chatId").apply()
+        hiddenMsgs.remove(chatId)
+        deleteCached(messages[chatId]?.map { it.id } ?: emptyList())
+        unread.remove(chatId)
+    }
+
+    /** "Delete chat for everyone": deletes every message and its chunks, then the chat doc, in batches of <= 450.
+     *  The chat id is the sorted uid pair, so starting a new chat with that person later simply recreates it. */
+    suspend fun deleteChatForEveryone(chatId: String): String? {
+        if (myUid.value == null) return "Not connected"
+        val d = db ?: return "Not connected"
+        val chatRef = d.collection("chats").document(chatId)
+        return try {
+            // A second pass catches anything the other person sent while the first pass was running.
+            for (pass in 0 until 3) {
+                val docs = chatRef.collection("messages").get().await().documents
+                if (docs.isEmpty()) break
+                val refs = ArrayList<DocumentReference>()
+                for (m in docs) {
+                    val hasChunks = (m.getString("type") ?: "text") != "text" || (m.getLong("chunkCount") ?: 0L) > 0L
+                    if (hasChunks) refs += m.reference.collection("chunks").get().await().documents.map { it.reference }
+                    refs += m.reference
+                }
+                commitDeletes(d, refs)
+                deleteCached(docs.map { it.id })
+            }
+            chatRef.delete().await()
+            forgetChatLocally(chatId, clearPrefs = true)
+            chats.removeAll { it.id == chatId }
+            null
+        } catch (e: Exception) { deleteError(e) }
+    }
+
+    /** Deletes a call's ICE candidate subdocs, then the call doc. Missing docs / already-deleted calls are ignored. */
+    suspend fun deleteCallDocs(callId: String): Boolean {
+        val d = db ?: return false
+        val ref = d.collection("calls").document(callId)
+        val cands = ArrayList<DocumentReference>()
+        for (side in listOf("callerCandidates", "calleeCandidates"))
+            try { cands += ref.collection(side).get().await().documents.map { it.reference } } catch (_: Exception) { }
+        try { commitDeletes(d, cands) } catch (_: Exception) { }
+        return try { ref.delete().await(); true } catch (_: Exception) { false }
+    }
+
+    /** Called when a call ends. The short delay lets the other phone see the final "ended"/"declined" status first. */
+    fun deleteCallSoon(callId: String, delayMs: Long = 3000) {
+        bg.launch { delay(delayMs); deleteCallDocs(callId) }
+    }
+
+    /** "Clear call history": deletes every call doc (and its candidates) where I'm the caller or callee, except a live call.
+     *  Returns how many were deleted, or an error text. */
+    suspend fun clearCallHistory(): Result<Int> {
+        val me = myUid.value ?: return Result.failure(IllegalStateException("Not connected"))
+        val d = db ?: return Result.failure(IllegalStateException("Not connected"))
+        return try {
+            val live = CallManager.state.value?.takeIf { CallManager.active }?.callId
+            val ids = (d.collection("calls").whereEqualTo("caller", me).get().await().documents +
+                d.collection("calls").whereEqualTo("callee", me).get().await().documents).map { it.id }.toSet() - setOfNotNull(live)
+            var done = 0
+            for (id in ids) if (deleteCallDocs(id)) done++
+            if (done < ids.size && done == 0) Result.failure(IllegalStateException("The server refused the delete. Make sure the latest Firestore rules (v1.3) are published."))
+            else Result.success(done)
+        } catch (e: Exception) { Result.failure(IllegalStateException(deleteError(e))) }
+    }
+
     /** Temporary plaintext copies made for "Open with" are wiped whenever chats are hidden. */
     fun clearOpenedFiles() { try { File(ctx.cacheDir, "open").deleteRecursively() } catch (_: Exception) { } }
 
     fun signOut() {
         CallManager.detach()
         chatsReg?.remove(); msgRegs.values.forEach { it.remove() }; msgRegs.clear()
+        pubRegs.values.forEach { it.remove() }; pubRegs.clear()
         chats.clear(); messages.clear(); myName.value = null; ready.value = false
         auth?.signOut(); myUid.value = null
     }

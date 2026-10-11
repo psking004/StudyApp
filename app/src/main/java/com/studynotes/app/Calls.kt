@@ -43,6 +43,7 @@ data class CallState(
  * calls/{callId} {caller, callee, callerName, calleeName, type, status, offer, answer, createdMs, created}
  * calls/{callId}/callerCandidates/{id}, calls/{callId}/calleeCandidates/{id}.
  * Media is peer-to-peer and DTLS-SRTP encrypted by WebRTC itself.
+ * v1.3: when a call ends (either side), the call doc and both candidate subcollections are deleted ~3 s later.
  */
 object CallManager {
     val state = mutableStateOf<CallState?>(null)
@@ -220,6 +221,11 @@ object CallManager {
             d ?: return@addSnapshotListener
             val st = state.value ?: return@addSnapshotListener
             if (st.callId != callId) return@addSnapshotListener
+            // v1.3: the call doc is deleted shortly after a call ends. If it vanishes under us, the call is over.
+            if (!d.exists()) {
+                if (!d.metadata.isFromCache) endLocal(if (st.phase == CallPhase.Incoming) "Missed call" else "Call ended", writeStatus = false)
+                return@addSnapshotListener
+            }
             when (d.getString("status")) {
                 "declined" -> endLocal(if (st.incoming) "Call ended" else "Declined", writeStatus = false)
                 "ended" -> endLocal(if (st.phase == CallPhase.Incoming) "Missed call" else "Call ended", writeStatus = false)
@@ -350,6 +356,8 @@ object CallManager {
         cancelTimeout()
         onRingingStopped?.invoke()
         if (writeStatus) repo?.firestore?.collection("calls")?.document(s.callId)?.update("status", "ended")
+        // Don't keep call records: remove the call doc and its ICE candidates once the other phone has seen the end.
+        repo?.deleteCallSoon(s.callId)
         docReg?.remove(); docReg = null
         candReg?.remove(); candReg = null
         cleanupMedia()

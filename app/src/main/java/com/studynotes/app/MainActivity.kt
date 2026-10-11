@@ -105,15 +105,15 @@ class MainActivity : ComponentActivity() {
         nm.createNotificationChannel(NotificationChannel("rem", "Study reminders", NotificationManager.IMPORTANCE_DEFAULT))
     }
 
-    /** Incoming call while the app is in the background: same harmless-looking reminder text. */
+    /** Incoming call while the app is in the background: the same generic "Study reminder", no caller, no content. */
     private fun notifyCall() {
-        if (App.foreground) return
+        if (App.foreground || !secret.notificationsOn) return
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
         val pi = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE)
         val n = NotificationCompat.Builder(this, "rem")
             .setSmallIcon(android.R.drawable.ic_menu_edit)
-            .setContentTitle("Study Notes")
-            .setContentText("Reminder: your study session is starting now")
+            .setContentTitle(NOTIF_TEXT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setTimeoutAfter(45_000)
             .setContentIntent(pi).setAutoCancel(true).build()
@@ -122,16 +122,20 @@ class MainActivity : ComponentActivity() {
 
     private fun notifyDisguised() {
         if (App.foreground && screen.value is Screen.Hidden) return
+        if (!secret.notificationsOn) return
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
         val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE)
         val n = NotificationCompat.Builder(this, "rem")
             .setSmallIcon(android.R.drawable.ic_menu_edit)
-            .setContentTitle("Study Notes")
-            .setContentText("Reminder: time to revise your notes")
+            .setContentTitle(NOTIF_TEXT)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setContentIntent(pi).setAutoCancel(true).build()
         try { NotificationManagerCompat.from(this).notify(7, n) } catch (_: SecurityException) {}
     }
 }
+
+/** The only text any chat or call notification ever shows: no sender name, no message content. */
+const val NOTIF_TEXT = "Study reminder"
 
 object App {
     @Volatile var foreground = false

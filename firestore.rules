@@ -15,6 +15,8 @@ service cloud.firestore {
       allow list: if request.auth != null && request.auth.uid in resource.data.members;
       allow create, update: if request.auth != null && request.auth.uid in chatId.split('_')
                             && request.auth.uid in request.resource.data.members;
+      // v1.3 "Delete chat for everyone": either member may delete the chat doc (after its messages and chunks).
+      allow delete: if request.auth != null && request.auth.uid in resource.data.members;
       match /messages/{m} {
         allow read: if request.auth != null && request.auth.uid in chatId.split('_');
         // Text messages: {from, cipher, ts, delivered}. Attachments (v1.2) add {type, meta, chunkCount, size};
@@ -30,6 +32,8 @@ service cloud.firestore {
                           && request.resource.data.size > 0 && request.resource.data.size <= 6000000));
         allow update: if request.auth != null && request.auth.uid in chatId.split('_')
                       && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['delivered']);
+        // v1.3: chat members may delete messages ("Delete for everyone" on a message, or deleting the whole chat).
+        allow delete: if request.auth != null && request.auth.uid in chatId.split('_');
         // Encrypted attachment bytes (AES-GCM ciphertext), split into ~700 KB chunks: {idx, data (bytes)}.
         match /chunks/{c} {
           allow read: if request.auth != null && request.auth.uid in chatId.split('_');
@@ -37,6 +41,8 @@ service cloud.firestore {
                         && request.resource.data.data is bytes
                         && request.resource.data.data.size() < 1000000
                         && request.resource.data.idx is int;
+          // v1.3: chat members may delete attachment chunks (with their message or the whole chat).
+          allow delete: if request.auth != null && request.auth.uid in chatId.split('_');
         }
       }
     }
@@ -54,8 +60,12 @@ service cloud.firestore {
                     && request.resource.data.caller == resource.data.caller
                     && request.resource.data.callee == resource.data.callee
                     && request.resource.data.status in ['ringing', 'accepted', 'ended', 'declined'];
+      // v1.3: the caller or callee may delete the call doc (when a call ends, or "Clear call history").
+      allow delete: if request.auth != null
+                    && (request.auth.uid == resource.data.caller || request.auth.uid == resource.data.callee);
       match /{side}/{cand} {
-        allow read, create: if request.auth != null
+        // v1.3: delete added so ICE candidates are cleaned up with their call (must happen before the call doc goes).
+        allow read, create, delete: if request.auth != null
                             && side in ['callerCandidates', 'calleeCandidates']
                             && (request.auth.uid == get(/databases/$(db)/documents/calls/$(callId)).data.caller
                                 || request.auth.uid == get(/databases/$(db)/documents/calls/$(callId)).data.callee);

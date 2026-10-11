@@ -21,6 +21,10 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -103,10 +107,16 @@ private fun UsernameSetup(repo: ChatRepo, onHide: () -> Unit) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 private fun ChatList(repo: ChatRepo, onOpen: (String) -> Unit, onNew: () -> Unit, onSettings: () -> Unit, onHide: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var chatMenu by remember { mutableStateOf<ChatItem?>(null) }
+    var confirmChat by remember { mutableStateOf<Pair<ChatItem, Boolean>?>(null) } // (chat, forEveryone)
+    var deleting by remember { mutableStateOf<String?>(null) }
+    val visible = repo.visibleChats()
     Scaffold(
         topBar = {
             TopAppBar(title = { Text("Chats", color = Color.White, fontWeight = FontWeight.Bold) },
@@ -122,18 +132,19 @@ private fun ChatList(repo: ChatRepo, onOpen: (String) -> Unit, onNew: () -> Unit
         floatingActionButton = { FloatingActionButton(onClick = onNew, containerColor = Color(0xFF25D366)) { Icon(Icons.Default.Chat, "New chat", tint = Color.White) } },
         containerColor = Color.White
     ) { pad ->
-        if (repo.chats.isEmpty())
+        if (visible.isEmpty())
             Box(Modifier.padding(pad).fillMaxSize(), contentAlignment = Alignment.Center) { Text("No chats yet. Tap the button to message a username.", color = Color.Gray, modifier = Modifier.padding(32.dp)) }
         LazyColumn(Modifier.padding(pad)) {
-            items(repo.chats, key = { it.id }) { c ->
+            items(visible, key = { it.id }) { c ->
                 val unread = repo.unread[c.id] ?: 0
-                Row(Modifier.fillMaxWidth().clickable { onOpen(c.id) }.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().combinedClickable(onClick = { if (deleting != c.id) onOpen(c.id) }, onLongClick = { if (deleting == null) chatMenu = c })
+                    .padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Avatar(c.peerName)
                     Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f)) {
                         Text("@${c.peerName}", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
-                        val prev = repo.preview(c)
-                        Text((if (c.lastFrom == repo.myUid.value && prev.isNotBlank()) "You: " else "") + prev.ifBlank { "Say hi 👋" },
+                        val (prev, fromMe) = repo.previewOf(c)
+                        Text(if (deleting == c.id) "Deleting..." else (if (fromMe && prev.isNotBlank()) "You: " else "") + prev.ifBlank { "Say hi 👋" },
                             color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     Column(horizontalAlignment = Alignment.End) {
@@ -146,6 +157,35 @@ private fun ChatList(repo: ChatRepo, onOpen: (String) -> Unit, onNew: () -> Unit
             }
         }
     }
+    chatMenu?.let { c ->
+        AlertDialog(onDismissRequest = { chatMenu = null },
+            title = { Text("Chat with @${c.peerName}") },
+            text = {
+                Column {
+                    TextButton(onClick = { chatMenu = null; confirmChat = c to false }, modifier = Modifier.fillMaxWidth()) { Text("Delete for me", Modifier.fillMaxWidth()) }
+                    TextButton(onClick = { chatMenu = null; confirmChat = c to true }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Delete for everyone", Modifier.fillMaxWidth(), color = Color(0xFFD32F2F)) }
+                }
+            },
+            confirmButton = {}, dismissButton = { TextButton(onClick = { chatMenu = null }) { Text("Cancel") } })
+    }
+    confirmChat?.let { (c, everyone) ->
+        AlertDialog(onDismissRequest = { confirmChat = null },
+            title = { Text(if (everyone) "Delete chat for everyone?" else "Delete chat for me?") },
+            text = { Text(if (everyone) "All messages, photos and files in this chat will be permanently deleted from both phones and the server. This can't be undone."
+                          else "The chat and its messages will be removed from this phone only. @${c.peerName} keeps their copy. The chat comes back if they send a new message.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmChat = null
+                    if (!everyone) repo.deleteChatForMe(c.id)
+                    else { deleting = c.id; scope.launch {
+                        val err = repo.deleteChatForEveryone(c.id); deleting = null
+                        Toast.makeText(ctx, err ?: "Chat deleted", Toast.LENGTH_LONG).show()
+                    } }
+                }) { Text("Delete", color = Color(0xFFD32F2F)) }
+            },
+            dismissButton = { TextButton(onClick = { confirmChat = null }) { Text("Cancel") } })
+    }
 }
 
 @Composable
@@ -155,12 +195,17 @@ private fun Avatar(name: String) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
     DisposableEffect(chatId) { repo.openChat = chatId; repo.unread.remove(chatId); onDispose { repo.openChat = null } }
     val chat = repo.chats.firstOrNull { it.id == chatId }
-    val msgs = repo.messages[chatId] ?: emptyList()
+    val msgs = repo.visibleMessages(chatId)
+    // If the chat is deleted for everyone (by either person) while it's open, go back to the list.
+    var seenChat by remember { mutableStateOf(false) }
+    LaunchedEffect(chat == null) { if (chat != null) seenChat = true else if (seenChat) onBack() }
+    var msgMenu by remember { mutableStateOf<Msg?>(null) }
+    var confirmMsg by remember { mutableStateOf<Pair<Msg, Boolean>?>(null) } // (message, forEveryone)
     LaunchedEffect(msgs.size) { repo.unread.remove(chatId) }
     var text by remember { mutableStateOf("") }
     val list = rememberLazyListState()
@@ -238,10 +283,11 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
             items(msgs, key = { it.id }) { m ->
                 val mine = m.from == repo.myUid.value
                 Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
-                    Column(Modifier.widthIn(max = 280.dp).background(if (mine) OutBubble else Color.White, RoundedCornerShape(10.dp)).padding(horizontal = 10.dp, vertical = 6.dp)) {
+                    Column(Modifier.widthIn(max = 280.dp).clip(RoundedCornerShape(10.dp)).background(if (mine) OutBubble else Color.White)
+                        .combinedClickable(onClick = {}, onLongClick = { msgMenu = m }).padding(horizontal = 10.dp, vertical = 6.dp)) {
                         when (m.type) {
-                            "image" -> ImageThumb(repo, chatId, m) { viewing = m }
-                            "file" -> FileRow(m, repo.downloads[m.id]) { if (m.available) fileAction = m else toast("This file isn't available. It was sent from an older version of the app.") }
+                            "image" -> ImageThumb(repo, chatId, m, onLong = { msgMenu = m }) { viewing = m }
+                            "file" -> FileRow(m, repo.downloads[m.id], onLong = { msgMenu = m }) { if (m.available) fileAction = m else toast("This file isn't available. It was sent from an older version of the app.") }
                             else -> Text(m.text, fontSize = 15.sp)
                         }
                         Row(Modifier.align(Alignment.End), verticalAlignment = Alignment.CenterVertically) {
@@ -273,6 +319,33 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
         }
     }
     viewing?.let { m -> FullImage(repo, chatId, m) { viewing = null } }
+    msgMenu?.let { m ->
+        val mine = m.from == repo.myUid.value
+        AlertDialog(onDismissRequest = { msgMenu = null },
+            title = { Text("Message") },
+            text = {
+                Column {
+                    TextButton(onClick = { msgMenu = null; confirmMsg = m to false }, modifier = Modifier.fillMaxWidth()) { Text("Delete for me", Modifier.fillMaxWidth()) }
+                    if (mine) TextButton(onClick = { msgMenu = null; confirmMsg = m to true }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Delete for everyone", Modifier.fillMaxWidth(), color = Color(0xFFD32F2F)) }
+                }
+            },
+            confirmButton = {}, dismissButton = { TextButton(onClick = { msgMenu = null }) { Text("Cancel") } })
+    }
+    confirmMsg?.let { (m, everyone) ->
+        AlertDialog(onDismissRequest = { confirmMsg = null },
+            title = { Text(if (everyone) "Delete for everyone?" else "Delete for me?") },
+            text = { Text(if (everyone) "This message" + (if (m.type != "text") " and its encrypted attachment" else "") + " will be permanently deleted from both phones and the server."
+                          else "This message will be removed from this phone only. The other person still has it.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmMsg = null
+                    if (!everyone) repo.deleteMessageForMe(chatId, m)
+                    else scope.launch { repo.deleteMessageForEveryone(chatId, m)?.let { toast(it) } }
+                }) { Text("Delete", color = Color(0xFFD32F2F)) }
+            },
+            dismissButton = { TextButton(onClick = { confirmMsg = null }) { Text("Cancel") } })
+    }
     fileAction?.let { m ->
         AlertDialog(onDismissRequest = { fileAction = null },
             title = { Text(m.name.ifBlank { "File" }, maxLines = 2, overflow = TextOverflow.Ellipsis) },
@@ -318,8 +391,9 @@ private fun decodeSampled(bytes: ByteArray, maxSide: Int): Bitmap? {
     return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = s })
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ImageThumb(repo: ChatRepo, chatId: String, m: Msg, onOpen: () -> Unit) {
+private fun ImageThumb(repo: ChatRepo, chatId: String, m: Msg, onLong: () -> Unit, onOpen: () -> Unit) {
     var bmp by remember(m.id) { mutableStateOf<Bitmap?>(null) }
     var failed by remember(m.id) { mutableStateOf(false) }
     val progress = repo.downloads[m.id]
@@ -329,8 +403,8 @@ private fun ImageThumb(repo: ChatRepo, chatId: String, m: Msg, onOpen: () -> Uni
     }
     val b = bmp
     if (b != null) Image(b.asImageBitmap(), "Photo", contentScale = ContentScale.Crop,
-        modifier = Modifier.width(240.dp).heightIn(max = 320.dp).aspectRatio(b.width.toFloat() / b.height.coerceAtLeast(1)).clip(RoundedCornerShape(8.dp)).clickable { onOpen() })
-    else Box(Modifier.size(240.dp, 180.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFFDFE5E7)), contentAlignment = Alignment.Center) {
+        modifier = Modifier.width(240.dp).heightIn(max = 320.dp).aspectRatio(b.width.toFloat() / b.height.coerceAtLeast(1)).clip(RoundedCornerShape(8.dp)).combinedClickable(onClick = onOpen, onLongClick = onLong))
+    else Box(Modifier.size(240.dp, 180.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFFDFE5E7)).combinedClickable(onClick = {}, onLongClick = onLong), contentAlignment = Alignment.Center) {
         when {
             failed && !m.available -> Text("📷 Photo unavailable\n(sent from an older version)", color = Color.Gray, fontSize = 13.sp, textAlign = TextAlign.Center)
             failed -> Text("📷 Photo couldn't load", color = Color.Gray, fontSize = 13.sp)
@@ -354,9 +428,10 @@ private fun FullImage(repo: ChatRepo, chatId: String, m: Msg, onClose: () -> Uni
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun FileRow(m: Msg, progress: Float?, onClick: () -> Unit) {
-    Row(Modifier.widthIn(min = 200.dp).clip(RoundedCornerShape(8.dp)).background(Color(0x14000000)).clickable { onClick() }.padding(10.dp),
+private fun FileRow(m: Msg, progress: Float?, onLong: () -> Unit, onClick: () -> Unit) {
+    Row(Modifier.widthIn(min = 200.dp).clip(RoundedCornerShape(8.dp)).background(Color(0x14000000)).combinedClickable(onClick = onClick, onLongClick = onLong).padding(10.dp),
         verticalAlignment = Alignment.CenterVertically) {
         Icon(Icons.Default.InsertDriveFile, null, tint = WaGreen, modifier = Modifier.size(32.dp))
         Spacer(Modifier.width(8.dp))
@@ -401,26 +476,72 @@ private fun NewChat(repo: ChatRepo, onBack: () -> Unit, onStarted: (String) -> U
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun Settings(repo: ChatRepo, secret: SecretStore, onBack: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
     var newWord by remember { mutableStateOf("") }
+    var confirmWord by remember { mutableStateOf("") }
     var saved by remember { mutableStateOf(false) }
+    var notifOn by remember { mutableStateOf(secret.notificationsOn) }
+    var confirmClear by remember { mutableStateOf(false) }
+    var clearing by remember { mutableStateOf(false) }
+    val wordOk = newWord.trim().length >= 3 && newWord.trim().lowercase() == confirmWord.trim().lowercase()
     Scaffold(topBar = {
         TopAppBar(title = { Text("Settings", color = Color.White) }, navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Back", tint = Color.White) } },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = WaGreen))
     }, containerColor = Color.White) { pad ->
-        Column(Modifier.padding(pad).padding(20.dp)) {
+        Column(Modifier.padding(pad).verticalScroll(rememberScrollState()).padding(20.dp)) {
             Text("Username", fontWeight = FontWeight.SemiBold); Text("@${repo.myName.value}", color = Color.Gray)
+
             Spacer(Modifier.height(24.dp))
-            Text("Secret search word", fontWeight = FontWeight.SemiBold)
-            Text("Typing this in Search notes opens your chats.", color = Color.Gray, fontSize = 13.sp)
-            OutlinedTextField(newWord, { newWord = it; saved = false }, label = { Text("New secret word") }, singleLine = true,
+            Text("Privacy", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = WaGreen)
+
+            Spacer(Modifier.height(12.dp))
+            Text("Passcode", fontWeight = FontWeight.SemiBold)
+            Text("Typing this in Search notes opens your chats. " + (if (secret.isDefault) "You're still using the default passcode." else "Only a salted hash of it is stored on this phone."),
+                color = Color.Gray, fontSize = 13.sp)
+            OutlinedTextField(newWord, { newWord = it; saved = false }, label = { Text("New passcode") }, singleLine = true,
                 visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-            Spacer(Modifier.height(8.dp))
-            Button(enabled = newWord.trim().length >= 3, onClick = { secret.set(newWord); newWord = ""; saved = true }) { Text("Save") }
-            if (saved) Text("Saved. Use the new word next time.", color = WaGreen)
+            OutlinedTextField(confirmWord, { confirmWord = it; saved = false }, label = { Text("Confirm new passcode") }, singleLine = true,
+                visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
+                isError = confirmWord.isNotBlank() && !wordOk,
+                supportingText = { if (confirmWord.isNotBlank() && newWord.trim().length >= 3 && !wordOk) Text("Passcodes don't match") else Text("At least 3 characters. Not case-sensitive.") })
+            Button(enabled = wordOk, onClick = { secret.set(newWord); newWord = ""; confirmWord = ""; saved = true }) { Text("Change passcode") }
+            if (saved) Text("Saved. Use the new passcode next time.", color = WaGreen)
+
+            Spacer(Modifier.height(20.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Notifications", fontWeight = FontWeight.SemiBold)
+                    Text("New messages and calls show only \"$NOTIF_TEXT\", with no sender or message text. Turn off to get no alerts at all.",
+                        color = Color.Gray, fontSize = 13.sp)
+                }
+                Spacer(Modifier.width(8.dp))
+                Switch(checked = notifOn, onCheckedChange = { notifOn = it; secret.notificationsOn = it })
+            }
+
+            Spacer(Modifier.height(20.dp))
+            Text("Call history", fontWeight = FontWeight.SemiBold)
+            Text("Calls are deleted from the server when they end. This also removes any older call records.", color = Color.Gray, fontSize = 13.sp)
+            OutlinedButton(enabled = !clearing, onClick = { confirmClear = true }) { Text(if (clearing) "Clearing..." else "Clear call history") }
+
             Spacer(Modifier.height(24.dp))
-            Text("Chats lock automatically after 60 seconds idle or when you leave the app.", color = Color.Gray, fontSize = 13.sp)
+            Text("Chats lock automatically after 60 seconds idle, when you leave the app, or when you press back from the chat list. Screenshots are blocked.",
+                color = Color.Gray, fontSize = 13.sp)
         }
     }
+    if (confirmClear) AlertDialog(onDismissRequest = { confirmClear = false },
+        title = { Text("Clear call history?") },
+        text = { Text("Every call record you were part of is deleted from the server. A call in progress isn't affected.") },
+        confirmButton = {
+            TextButton(onClick = {
+                confirmClear = false; clearing = true
+                scope.launch {
+                    val r = repo.clearCallHistory(); clearing = false
+                    Toast.makeText(ctx, r.fold({ if (it == 0) "No call history to clear" else "Call history cleared" }, { it.message ?: "Couldn't clear call history" }), Toast.LENGTH_LONG).show()
+                }
+            }) { Text("Clear", color = Color(0xFFD32F2F)) }
+        },
+        dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } })
 }
 
 private fun time(t: Long): String {

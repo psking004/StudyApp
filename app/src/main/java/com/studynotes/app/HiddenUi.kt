@@ -1,6 +1,17 @@
 package com.studynotes.app
 
+import android.Manifest
+import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.style.TextDecoration
+import kotlinx.coroutines.delay
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -230,7 +241,33 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
     var viewing by remember { mutableStateOf<Msg?>(null) }
     var fileAction by remember { mutableStateOf<Msg?>(null) }
     var pendingCallVideo by remember { mutableStateOf<Boolean?>(null) }
+    var linkToOpen by remember { mutableStateOf<String?>(null) }
     fun toast(t: String) = Toast.makeText(ctx, t, Toast.LENGTH_LONG).show()
+    // ---- v1.5 voice messages ----
+    val recorder = remember { VoiceRecorder(ctx.applicationContext) }
+    val recording by recorder.recording
+    var recElapsed by remember { mutableStateOf(0L) }
+    // Recording counts as activity, so the idle lock never cuts a recording at 60 s (the 2-minute cap still applies).
+    LaunchedEffect(recording) { while (recording) { recElapsed = recorder.elapsedMs(); PrivacyLock.touch(); delay(200) } }
+    // Leaving the chat for any reason (back, lock, background, screen off) discards an unfinished recording and stops playback.
+    DisposableEffect(Unit) { onDispose { recorder.cancel(); VoicePlayer.stop() } }
+    fun sendRecording() {
+        val r = recorder.stop() ?: return toast("That was too short. Tap the mic, speak, then tap send.")
+        scope.launch { repo.sendVoice(chatId, r.first, r.second)?.let { toast(it) } }
+    }
+    fun startRecording() {
+        if (CallManager.active) return toast("You can't record a voice message during a call.")
+        if (chat == null || chat.peerPub.isBlank()) return toast("Chat not ready yet. Try again in a moment.")
+        VoicePlayer.stop()
+        PrivacyLock.touch()
+        recorder.start(onMaxReached = { sendRecording() })?.let { toast(it) }
+    }
+    val micPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        if (ok) startRecording() else toast("Allow the microphone to send voice messages.")
+    }
+    fun mic() {
+        if (hasPermissions(ctx, arrayOf(Manifest.permission.RECORD_AUDIO))) startRecording() else micPerm.launch(Manifest.permission.RECORD_AUDIO)
+    }
     fun upload(uri: Uri?, image: Boolean) {
         if (uri == null) return
         scope.launch { repo.sendAttachment(chatId, uri, image)?.let { toast(it) } }
@@ -270,6 +307,19 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
         },
         bottomBar = {
             Row(Modifier.fillMaxWidth().background(WaBg).navigationBarsPadding().imePadding().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+              if (recording) {
+                IconButton(onClick = { recorder.cancel() }) { Icon(Icons.Default.Delete, "Cancel recording", tint = Color(0xFFD32F2F)) }
+                Row(Modifier.weight(1f).height(48.dp).clip(RoundedCornerShape(24.dp)).background(Color.White).padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(10.dp).clip(CircleShape).background(Color(0xFFE53935)))
+                    Spacer(Modifier.width(10.dp))
+                    Text("Recording  ${dur(recElapsed)} / ${dur(MAX_VOICE_MS)}", color = Color(0xFF54656F))
+                }
+                Spacer(Modifier.width(6.dp))
+                FloatingActionButton(onClick = { sendRecording() }, containerColor = WaGreen, shape = CircleShape, modifier = Modifier.size(48.dp)) {
+                    Icon(Icons.Default.Send, "Send voice message", tint = Color.White)
+                }
+              } else {
                 Box {
                     IconButton(onClick = { attachMenu = true }) { Icon(Icons.Default.AttachFile, "Attach", tint = Color(0xFF54656F)) }
                     DropdownMenu(attachMenu, { attachMenu = false }) {
@@ -279,12 +329,16 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                             attachMenu = false; App.allowExternal(); pickFile.launch("*/*") })
                     }
                 }
-                TextField(text, { text = it }, placeholder = { Text("Message") }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(24.dp), maxLines = 5,
+                // Plain text field: pasted links are kept exactly as pasted (nothing filters or rewrites them).
+                // Typing counts as activity for the idle lock (soft-keyboard input doesn't reach onUserInteraction).
+                TextField(text, { text = it; PrivacyLock.touch() }, placeholder = { Text("Message") }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(24.dp), maxLines = 5,
                     colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White, focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
                 Spacer(Modifier.width(6.dp))
-                FloatingActionButton(onClick = { if (text.isNotBlank()) { repo.send(chatId, text.trim()); text = "" } }, containerColor = WaGreen, shape = CircleShape, modifier = Modifier.size(48.dp)) {
-                    Icon(Icons.Default.Send, "Send", tint = Color.White)
+                val empty = text.isBlank()
+                FloatingActionButton(onClick = { if (empty) mic() else { repo.send(chatId, text.trim()); text = "" } }, containerColor = WaGreen, shape = CircleShape, modifier = Modifier.size(48.dp)) {
+                    Icon(if (empty) Icons.Default.Mic else Icons.Default.Send, if (empty) "Record voice message" else "Send", tint = Color.White)
                 }
+              }
             }
         },
         containerColor = WaBg
@@ -299,8 +353,9 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                         .combinedClickable(onClick = {}, onLongClick = { msgMenu = m }).padding(horizontal = 10.dp, vertical = 6.dp)) {
                         when (m.type) {
                             "image" -> ImageThumb(repo, chatId, m, onLong = { msgMenu = m }) { viewing = m }
-                            "file" -> FileRow(m, repo.downloads[m.id], onLong = { msgMenu = m }) { if (m.available) fileAction = m else toast("This file isn't available. It was sent from an older version of the app.") }
-                            else -> Text(m.text, fontSize = 15.sp)
+                            "file" -> if (m.voice) VoiceRow(repo, chatId, m, onLong = { msgMenu = m }) { toast(it) }
+                                else FileRow(m, repo.downloads[m.id], onLong = { msgMenu = m }) { if (m.available) fileAction = m else toast("This file isn't available. It was sent from an older version of the app.") }
+                            else -> LinkText(m.text, onLong = { msgMenu = m }) { linkToOpen = it }
                         }
                         Row(Modifier.align(Alignment.End), verticalAlignment = Alignment.CenterVertically) {
                             Text(time(m.ts), fontSize = 11.sp, color = Color.Gray)
@@ -317,9 +372,9 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                 Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), horizontalArrangement = Arrangement.End) {
                     Column(Modifier.widthIn(min = 180.dp, max = 280.dp).background(OutBubble, RoundedCornerShape(10.dp)).padding(10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(if (u.isImage) Icons.Default.Image else Icons.Default.InsertDriveFile, null, tint = Color(0xFF54656F), modifier = Modifier.size(20.dp))
+                            Icon(when { u.isVoice -> Icons.Default.Mic; u.isImage -> Icons.Default.Image; else -> Icons.Default.InsertDriveFile }, null, tint = Color(0xFF54656F), modifier = Modifier.size(20.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text(if (u.isImage) "Sending photo..." else u.name, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(when { u.isVoice -> "Sending voice message..."; u.isImage -> "Sending photo..."; else -> u.name }, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         Spacer(Modifier.height(6.dp))
                         if (u.progress <= 0f) LinearProgressIndicator(Modifier.fillMaxWidth(), color = WaGreen)
@@ -331,6 +386,17 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
         }
     }
     viewing?.let { m -> FullImage(repo, chatId, m) { viewing = null } }
+    linkToOpen?.let { url ->
+        AlertDialog(onDismissRequest = { linkToOpen = null },
+            title = { Text("Open link?") },
+            text = { Text(url + "\n\nIt opens in your browser. Chats lock when you leave the app.", fontSize = 14.sp) },
+            confirmButton = { TextButton(onClick = { linkToOpen = null; openLink(ctx, url) { toast(it) } }) { Text("Open") } },
+            dismissButton = { TextButton(onClick = {
+                linkToOpen = null
+                (ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("link", url))
+                toast("Link copied")
+            }) { Text("Copy") } })
+    }
     msgMenu?.let { m ->
         val mine = m.from == repo.myUid.value
         AlertDialog(onDismissRequest = { msgMenu = null },
@@ -352,6 +418,7 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
             confirmButton = {
                 TextButton(onClick = {
                     confirmMsg = null
+                    if (VoicePlayer.current.value == m.id) VoicePlayer.stop()
                     if (!everyone) repo.deleteMessageForMe(chatId, m)
                     else scope.launch { repo.deleteMessageForEveryone(chatId, m)?.let { toast(it) } }
                 }) { Text("Delete", color = Color(0xFFD32F2F)) }
@@ -386,6 +453,103 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                     }
                 }) { Text("Open") }
             })
+    }
+}
+
+// ===================== v1.5: clickable links =====================
+
+private const val LINK_TLDS = "com|in|org|net|io|dev|app|co|me|edu|gov|info|xyz|ai|ly|gg|tv|us|uk|so|to|link|site|online|tech|store|page|live|news|blog"
+private val UrlRegex = Regex("""(?i)\b(?:https?://|www\.)[^\s<>"]+|\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:$LINK_TLDS)\b(?:[/?#][^\s<>"]*)?""")
+
+/** Finds web links in a message: http(s)://..., www.... and bare domains like example.com/page. Emails are skipped.
+ *  Returns (character range, url to open); bare links get https://. */
+internal fun findLinks(text: String): List<Pair<IntRange, String>> = UrlRegex.findAll(text).mapNotNull { m ->
+    val start = m.range.first
+    if (start > 0 && (text[start - 1] == '@' || text[start - 1] == '.' || text[start - 1] == '/')) return@mapNotNull null
+    var v = m.value
+    while (v.isNotEmpty() && v.last() in ".,;:!?)]}'\"") {
+        if (v.last() == ')' && v.count { it == '(' } >= v.count { it == ')' }) break
+        v = v.dropLast(1)
+    }
+    if (v.length < 4) return@mapNotNull null
+    val url = if (v.startsWith("http://", true) || v.startsWith("https://", true)) v else "https://$v"
+    IntRange(start, start + v.length - 1) to url
+}.toList()
+
+/** Opens a link in the browser. Only http/https are ever opened (no intent:, file:, javascript: etc.). */
+private fun openLink(ctx: android.content.Context, url: String, onError: (String) -> Unit) {
+    val u = Uri.parse(url)
+    if (u.scheme?.lowercase() !in setOf("http", "https") || u.host.isNullOrBlank()) return onError("That link can't be opened.")
+    try {
+        ctx.startActivity(Intent(Intent.ACTION_VIEW, u).addCategory(Intent.CATEGORY_BROWSABLE).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    } catch (_: ActivityNotFoundException) { onError("No browser on this phone can open this link.") }
+}
+
+/** Message text with links underlined; tap a link to open it, long-press anywhere for the message menu. */
+@Composable
+private fun LinkText(text: String, onLong: () -> Unit, onLink: (String) -> Unit) {
+    val links = remember(text) { findLinks(text) }
+    if (links.isEmpty()) { Text(text, fontSize = 15.sp); return }
+    val annotated = remember(text) {
+        buildAnnotatedString {
+            append(text)
+            links.forEach { (r, u) ->
+                addStyle(SpanStyle(color = Color(0xFF027EB5), textDecoration = TextDecoration.Underline), r.first, r.last + 1)
+                addStringAnnotation("URL", u, r.first, r.last + 1)
+            }
+        }
+    }
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    Text(annotated, fontSize = 15.sp, onTextLayout = { layout = it }, modifier = Modifier.pointerInput(annotated) {
+        detectTapGestures(onLongPress = { onLong() }, onTap = { pos ->
+            val l = layout ?: return@detectTapGestures
+            val off = l.getOffsetForPosition(pos)
+            annotated.getStringAnnotations("URL", off, off).firstOrNull()?.let { onLink(it.item) }
+        })
+    })
+}
+
+// ===================== v1.5: voice messages =====================
+
+private fun dur(ms: Long): String { val s = (ms / 1000).coerceAtLeast(0); return "%d:%02d".format(s / 60, s % 60) }
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun VoiceRow(repo: ChatRepo, chatId: String, m: Msg, onLong: () -> Unit, toast: (String) -> Unit) {
+    val scope = rememberCoroutineScope()
+    val isCur = VoicePlayer.current.value == m.id
+    val playing = isCur && VoicePlayer.playing.value
+    var loading by remember(m.id) { mutableStateOf(false) }
+    val dl = repo.downloads[m.id]
+    LaunchedEffect(playing) { while (playing) { VoicePlayer.tick(); delay(250) } }
+    Row(Modifier.width(230.dp).clip(RoundedCornerShape(8.dp)).combinedClickable(onClick = {}, onLongClick = onLong).padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = {
+            PrivacyLock.touch()
+            when {
+                isCur -> VoicePlayer.toggle()
+                !m.available -> toast("This voice message isn't available.")
+                loading -> {}
+                else -> { loading = true; scope.launch {
+                    val b = repo.loadAttachment(chatId, m)
+                    loading = false
+                    if (b == null) toast("Couldn't download the voice message. Check your connection.")
+                    else if (!VoicePlayer.play(m.id, b)) toast("Couldn't play this voice message.")
+                } }
+            }
+        }) {
+            if (loading) CircularProgressIndicator(progress = { dl ?: 0f }, color = WaGreen, modifier = Modifier.size(24.dp))
+            else Icon(if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, if (playing) "Pause" else "Play", tint = WaGreen, modifier = Modifier.size(30.dp))
+        }
+        Column(Modifier.weight(1f)) {
+            val total = if (isCur && VoicePlayer.durationMs.value > 0) VoicePlayer.durationMs.value else m.durationMs
+            val pos = if (isCur) VoicePlayer.positionMs.value else 0L
+            LinearProgressIndicator(progress = { if (total > 0) (pos.toFloat() / total).coerceIn(0f, 1f) else 0f },
+                modifier = Modifier.fillMaxWidth().padding(end = 6.dp), color = WaGreen, trackColor = Color(0x33000000))
+            Spacer(Modifier.height(4.dp))
+            Text(if (isCur) "${dur(pos)} / ${dur(total)}" else dur(total), fontSize = 11.sp, color = Color.Gray)
+        }
+        Icon(Icons.Default.Mic, null, tint = Color(0xFF54656F), modifier = Modifier.size(18.dp))
     }
 }
 
@@ -524,7 +688,7 @@ private fun Settings(repo: ChatRepo, secret: SecretStore, onBack: () -> Unit) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Notifications", fontWeight = FontWeight.SemiBold)
-                    Text("New messages and calls show only \"$NOTIF_TEXT\", with no sender or message text. Turn off to get no alerts at all.",
+                    Text("New messages, voice messages and calls show only \"$NOTIF_TEXT: $NOTIF_BODY\", never a name or message text, and nothing on the lock screen. Turn off to get no alerts at all.",
                         color = Color.Gray, fontSize = 13.sp)
                 }
                 Spacer(Modifier.width(8.dp))
@@ -537,7 +701,7 @@ private fun Settings(repo: ChatRepo, secret: SecretStore, onBack: () -> Unit) {
             OutlinedButton(enabled = !clearing, onClick = { confirmClear = true }) { Text(if (clearing) "Clearing..." else "Clear call history") }
 
             Spacer(Modifier.height(24.dp))
-            Text("Chats lock automatically after 60 seconds idle, when you leave the app, or when you press back from the chat list. Screenshots are blocked.",
+            Text("Chats lock automatically after 1 minute idle, when you leave the app (Home, Recents, switching apps), when the screen turns off, or when you press back from the chat list. Screenshots and Recents previews are blocked.",
                 color = Color.Gray, fontSize = 13.sp)
         }
     }

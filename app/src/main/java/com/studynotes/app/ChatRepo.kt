@@ -31,6 +31,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 data class ChatItem(val id: String, val peerUid: String, val peerName: String, val peerPub: String,
                     val lastText: String, val updated: Long, val lastFrom: String)
@@ -39,10 +42,10 @@ data class ChatItem(val id: String, val peerUid: String, val peerName: String, v
  *  Cloud Storage "path" (never worked: no bucket) have chunkCount 0 and are shown as an unavailable attachment. */
 data class Msg(val id: String, val from: String, val text: String, val ts: Long, val delivered: Boolean, val pending: Boolean,
                val type: String = "text", val name: String = "", val mime: String = "", val size: Long = 0,
-               val chunkCount: Int = 0, val cipherSize: Long = 0) {
+               val chunkCount: Int = 0, val cipherSize: Long = 0, val voice: Boolean = false, val durationMs: Long = 0) {
     val available: Boolean get() = chunkCount > 0
 }
-data class Upload(val id: String, val chatId: String, val name: String, val isImage: Boolean, val progress: Float)
+data class Upload(val id: String, val chatId: String, val name: String, val isImage: Boolean, val progress: Float, val isVoice: Boolean = false)
 
 /** Attachments are stored in Firestore (free Spark plan, no Cloud Storage), so keep them small. */
 const val MAX_ATTACHMENT_BYTES = 5L * 1024 * 1024
@@ -245,17 +248,20 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
                 val c = chats.firstOrNull { it.id == chatId } ?: return@addSnapshotListener
                 messages[chatId] = snap.documents.map { d ->
                     val type = d.getString("type") ?: "text"
-                    var name = ""; var mime = ""; var size = 0L
+                    var name = ""; var mime = ""; var size = 0L; var voice = false; var dur = 0L
                     if (type != "text") d.getString("meta")?.let { m ->
                         try {
                             val o = JSONObject(crypto.decrypt(chatId, c.peerPub, m))
                             name = o.optString("name"); mime = o.optString("mime"); size = o.optLong("size")
+                            // v1.5 voice messages are type "file" (so no Firestore rules change and older apps show a playable
+                            // .m4a file); the encrypted meta marks them with voice=true and their duration.
+                            voice = o.optBoolean("voice", false); dur = o.optLong("dur", 0L)
                         } catch (_: Exception) { name = "🔒 Can't decrypt" }
                     }
                     Msg(d.id, d.getString("from") ?: "", crypto.decrypt(chatId, c.peerPub, d.getString("cipher") ?: ""),
                         d.getTimestamp("ts")?.toDate()?.time ?: System.currentTimeMillis(),
                         d.getBoolean("delivered") == true, d.metadata.hasPendingWrites(),
-                        type, name, mime, size, (d.getLong("chunkCount") ?: 0L).toInt(), d.getLong("size") ?: 0L)
+                        type, name, mime, size, (d.getLong("chunkCount") ?: 0L).toInt(), d.getLong("size") ?: 0L, voice, dur)
                 }
                 for (ch in snap.documentChanges) {
                     // Deleted for everyone (by the sender): drop any cached ciphertext of it on this phone too.
@@ -357,37 +363,71 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
                 return if (isImage) "Couldn't read that photo. Try another one." else "That file is too big or couldn't be read. Photos and files can be up to 5 MB."
             }
             val (bytes, name, mime) = prepared
-            if (bytes.size > MAX_ATTACHMENT_BYTES) { uploads.remove(msgId); return TOO_BIG }
-            val cipherBytes = withContext(Dispatchers.Default) { crypto.encryptBytes(chatId, c.peerPub, bytes) }
-            val count = (cipherBytes.size + CHUNK_BYTES - 1) / CHUNK_BYTES
-            // 1) Chunks first, one write per chunk so progress moves per chunk. Each is ~700 KB, under the 1 MiB doc limit.
-            val chunks = ref.collection("chunks")
-            for (i in 0 until count) {
-                val part = cipherBytes.copyOfRange(i * CHUNK_BYTES, minOf(cipherBytes.size, (i + 1) * CHUNK_BYTES))
-                d.batch().set(chunks.document(i.toString()), mapOf("idx" to i, "data" to Blob.fromBytes(part))).commit().await()
-                uploads[msgId]?.let { u -> uploads[msgId] = u.copy(progress = (i + 1).toFloat() / count) }
-            }
-            // 2) Then the message itself, which tells the receiver how many chunks to read.
-            val type = if (isImage) "image" else "file"
-            val meta = crypto.encrypt(chatId, c.peerPub, JSONObject().put("name", name).put("mime", mime).put("size", bytes.size.toLong()).toString())
-            val label = crypto.encrypt(chatId, c.peerPub, if (isImage) "📷 Photo" else "📎 $name")
-            // Keep a local ciphertext copy so the sender doesn't download it again.
-            withContext(Dispatchers.IO) { try { cacheFile(msgId).writeBytes(cipherBytes) } catch (_: Exception) { } }
-            ref.set(mapOf("from" to me, "cipher" to label, "type" to type, "meta" to meta,
-                "chunkCount" to count, "size" to cipherBytes.size.toLong(),
-                "ts" to FieldValue.serverTimestamp(), "delivered" to false)).await()
-            d.collection("chats").document(chatId).update(mapOf("last" to label, "lastFrom" to me, "updated" to FieldValue.serverTimestamp()))
-            uploads.remove(msgId)
-            null
+            uploadPrepared(chatId, ref, bytes, if (isImage) "image" else "file", name, mime,
+                if (isImage) "📷 Photo" else "📎 $name", JSONObject())
         } catch (e: Exception) {
             uploads.remove(msgId)
-            val t = (e.message + " " + (e.cause?.message ?: "")).lowercase()
-            when {
-                "too large" in t || "exceeds the maximum" in t || "invalid_argument" in t -> TOO_BIG
-                "permission" in t || "denied" in t -> "The server refused the upload. Make sure the latest Firestore rules are published."
-                else -> friendly(e)
-            }
+            uploadError(e)
         }
+    }
+
+    private fun uploadError(e: Exception): String {
+        val t = (e.message + " " + (e.cause?.message ?: "")).lowercase()
+        return when {
+            "too large" in t || "exceeds the maximum" in t || "invalid_argument" in t -> TOO_BIG
+            "permission" in t || "denied" in t -> "The server refused the upload. Make sure the latest Firestore rules are published."
+            else -> friendly(e)
+        }
+    }
+
+    /** Encrypts already-prepared bytes on the phone, writes the ciphertext as Firestore Blob chunks, then posts the message.
+     *  Shared by photos, files and (v1.5) voice messages. Returns an error text or null. Throws on Firestore errors. */
+    private suspend fun uploadPrepared(chatId: String, ref: DocumentReference, bytes: ByteArray, type: String, name: String,
+                                       mime: String, labelText: String, extraMeta: JSONObject): String? {
+        val me = myUid.value ?: return "Not connected"
+        val c = peerOf(chatId) ?: return "Chat not ready yet"
+        val d = db ?: return "Not connected"
+        val msgId = ref.id
+        if (bytes.size > MAX_ATTACHMENT_BYTES) { uploads.remove(msgId); return TOO_BIG }
+        val cipherBytes = withContext(Dispatchers.Default) { crypto.encryptBytes(chatId, c.peerPub, bytes) }
+        val count = (cipherBytes.size + CHUNK_BYTES - 1) / CHUNK_BYTES
+        // 1) Chunks first, one write per chunk so progress moves per chunk. Each is ~700 KB, under the 1 MiB doc limit.
+        val chunks = ref.collection("chunks")
+        for (i in 0 until count) {
+            val part = cipherBytes.copyOfRange(i * CHUNK_BYTES, minOf(cipherBytes.size, (i + 1) * CHUNK_BYTES))
+            d.batch().set(chunks.document(i.toString()), mapOf("idx" to i, "data" to Blob.fromBytes(part))).commit().await()
+            uploads[msgId]?.let { u -> uploads[msgId] = u.copy(progress = (i + 1).toFloat() / count) }
+        }
+        // 2) Then the message itself, which tells the receiver how many chunks to read.
+        val metaJson = extraMeta.put("name", name).put("mime", mime).put("size", bytes.size.toLong())
+        val meta = crypto.encrypt(chatId, c.peerPub, metaJson.toString())
+        val label = crypto.encrypt(chatId, c.peerPub, labelText)
+        // Keep a local ciphertext copy so the sender doesn't download it again.
+        withContext(Dispatchers.IO) { try { cacheFile(msgId).writeBytes(cipherBytes) } catch (_: Exception) { } }
+        ref.set(mapOf("from" to me, "cipher" to label, "type" to type, "meta" to meta,
+            "chunkCount" to count, "size" to cipherBytes.size.toLong(),
+            "ts" to FieldValue.serverTimestamp(), "delivered" to false)).await()
+        d.collection("chats").document(chatId).update(mapOf("last" to label, "lastFrom" to me, "updated" to FieldValue.serverTimestamp()))
+        uploads.remove(msgId)
+        return null
+    }
+
+    /** v1.5: sends a recorded voice message (AAC in an .m4a container) through the same encrypted chunk path.
+     *  The plaintext recording never leaves the phone; the caller deletes the temp file. Returns an error text or null. */
+    suspend fun sendVoice(chatId: String, bytes: ByteArray, durationMs: Long): String? {
+        if (myUid.value == null) return "Not connected"
+        val c = peerOf(chatId) ?: return "Chat not ready yet"
+        if (c.peerPub.isBlank()) return "Chat not ready yet. Try again in a moment."
+        if (bytes.isEmpty()) return "That recording was empty."
+        if (bytes.size > MAX_ATTACHMENT_BYTES) return "That voice message is too long to send."
+        val d = db ?: return "Not connected"
+        val ref = d.collection("chats").document(chatId).collection("messages").document()
+        val name = "voice-" + SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date()) + ".m4a"
+        uploads[ref.id] = Upload(ref.id, chatId, name, false, 0f, isVoice = true)
+        return try {
+            uploadPrepared(chatId, ref, bytes, "file", name, "audio/mp4", "🎤 Voice message",
+                JSONObject().put("voice", true).put("dur", durationMs))
+        } catch (e: Exception) { uploads.remove(ref.id); uploadError(e) }
     }
 
     private fun cacheFile(msgId: String): File = File(File(ctx.cacheDir, "att").apply { mkdirs() }, "$msgId.enc")

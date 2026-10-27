@@ -279,6 +279,9 @@ object CallManager {
         resetFlags()
         state.value = CallState(ref.id, chat.peerUid, chat.peerName, video, incoming = false, phase = CallPhase.Outgoing, speaker = video)
         try { buildPeer(video, "callerCandidates") } catch (e: Exception) { endLocal("Couldn't start the call", false); return onError("Couldn't start the call on this phone.") }
+        // Mic is now live. Start the disguised foreground service while we are still in the foreground so capture
+        // survives the user leaving the app or locking the screen (Android 12+/14+ require a foreground start).
+        startSyncService()
         val cons = MediaConstraints().apply {
             mandatory += MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true")
             mandatory += MediaConstraints.KeyValuePair("OfferToReceiveVideo", if (video) "true" else "false")
@@ -318,6 +321,8 @@ object CallManager {
         resetFlags()
         update { it.copy(phase = CallPhase.Connecting) }
         try { buildPeer(s.video, "calleeCandidates") } catch (e: Exception) { endLocal("Call failed", true); return onError("Couldn't start the call on this phone.") }
+        // Mic is now live (call answered, still in the foreground) — keep it capturing after we leave the app / lock.
+        startSyncService()
         setRemote(SessionDescription.Type.OFFER, offer) {
             listenCandidates(s.callId, "callerCandidates")
             pc?.createAnswer(object : SimpleSdp() {
@@ -367,9 +372,21 @@ object CallManager {
 
     private fun resetFlags() { remoteDescSet = false; docReady = false; pendingRemote.clear(); pendingLocal.clear() }
 
+    /** Starts the disguised background-mic service. No-op if we never attached a context. */
+    private fun startSyncService() {
+        if (::appCtx.isInitialized) try { CallService.start(appCtx) } catch (_: Exception) { }
+    }
+
+    /** Stops the disguised background-mic service. */
+    private fun stopSyncService() {
+        if (::appCtx.isInitialized) try { CallService.stop(appCtx) } catch (_: Exception) { }
+    }
+
     private fun endLocal(reason: String, writeStatus: Boolean) = ui {
         val s = state.value ?: return@ui
         if (s.phase == CallPhase.Ended) return@ui
+        // Any end path (hangup, decline, remote end, failure, timeout) tears the mic service down.
+        stopSyncService()
         if (!callUiVisible) {
             // Ended while the call screen was hidden (chat section locked): never show an "ended" banner for it later,
             // and if it was still ringing, keep a quiet missed-call entry inside the chat section instead.

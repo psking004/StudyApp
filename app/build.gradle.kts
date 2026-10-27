@@ -17,8 +17,8 @@ android {
         applicationId = "com.studynotes.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "1.6"
+        versionCode = 8
+        versionName = "1.7"
         // Phones only (WebRTC ships large native libs per ABI; x86 emulators are skipped to keep the APK small)
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }

@@ -42,8 +42,19 @@ data class ChatItem(val id: String, val peerUid: String, val peerName: String, v
  *  Cloud Storage "path" (never worked: no bucket) have chunkCount 0 and are shown as an unavailable attachment. */
 data class Msg(val id: String, val from: String, val text: String, val ts: Long, val delivered: Boolean, val pending: Boolean,
                val type: String = "text", val name: String = "", val mime: String = "", val size: Long = 0,
-               val chunkCount: Int = 0, val cipherSize: Long = 0, val voice: Boolean = false, val durationMs: Long = 0) {
+               val chunkCount: Int = 0, val cipherSize: Long = 0, val voice: Boolean = false, val durationMs: Long = 0,
+               val reply: ReplyRef? = null) {
     val available: Boolean get() = chunkCount > 0
+}
+/** v1.7 reply-to-message. Stored on the replying message as two optional Firestore fields: "replyTo" (the quoted message's
+ *  doc id) and "reply" (an encrypted JSON {from, text, kind, ts} made with the same per-chat key as message text, so the
+ *  quoted sender and snippet are never plaintext in Firestore). Messages without these fields are shown exactly as before.
+ *  kind: "text", "image", "voice" or "file"; text is the quoted snippet (text messages only). */
+data class ReplyRef(val id: String, val from: String, val text: String, val kind: String, val ts: Long) {
+    companion object {
+        fun of(m: Msg) = ReplyRef(m.id, m.from, if (m.type == "image" || m.type == "file") "" else m.text.take(160),
+            when { m.type == "image" -> "image"; m.type == "file" && m.voice -> "voice"; m.type == "file" -> "file"; else -> "text" }, m.ts)
+    }
 }
 data class Upload(val id: String, val chatId: String, val name: String, val isImage: Boolean, val progress: Float, val isVoice: Boolean = false)
 
@@ -258,10 +269,17 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
                             voice = o.optBoolean("voice", false); dur = o.optLong("dur", 0L)
                         } catch (_: Exception) { name = "🔒 Can't decrypt" }
                     }
+                    // v1.7: optional reply reference; absent on older messages (reply stays null, bubble unchanged).
+                    val reply = d.getString("replyTo")?.takeIf { it.isNotBlank() }?.let { rid ->
+                        try {
+                            val o = JSONObject(crypto.decrypt(chatId, c.peerPub, d.getString("reply") ?: ""))
+                            ReplyRef(rid, o.optString("from"), o.optString("text"), o.optString("kind", "text"), o.optLong("ts"))
+                        } catch (_: Exception) { ReplyRef(rid, "", "", "text", 0L) }
+                    }
                     Msg(d.id, d.getString("from") ?: "", crypto.decrypt(chatId, c.peerPub, d.getString("cipher") ?: ""),
                         d.getTimestamp("ts")?.toDate()?.time ?: System.currentTimeMillis(),
                         d.getBoolean("delivered") == true, d.metadata.hasPendingWrites(),
-                        type, name, mime, size, (d.getLong("chunkCount") ?: 0L).toInt(), d.getLong("size") ?: 0L, voice, dur)
+                        type, name, mime, size, (d.getLong("chunkCount") ?: 0L).toInt(), d.getLong("size") ?: 0L, voice, dur, reply)
                 }
                 for (ch in snap.documentChanges) {
                     // Deleted for everyone (by the sender): drop any cached ciphertext of it on this phone too.
@@ -281,13 +299,21 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
         msgRegs[chatId] = reg
     }
 
-    fun send(chatId: String, text: String) {
+    /** v1.7: the optional reply fields for a new message (empty map when not replying). The quote is encrypted like text. */
+    private fun replyFields(chatId: String, peerPub: String, r: ReplyRef?): Map<String, Any> {
+        if (r == null) return emptyMap()
+        val o = JSONObject().put("from", r.from).put("text", r.text).put("kind", r.kind).put("ts", r.ts)
+        return mapOf("replyTo" to r.id, "reply" to crypto.encrypt(chatId, peerPub, o.toString()))
+    }
+
+    fun send(chatId: String, text: String, reply: ReplyRef? = null) {
         val me = myUid.value ?: return
         val c = chats.firstOrNull { it.id == chatId } ?: return
         if (c.peerPub.isBlank()) return
         val cipher = crypto.encrypt(chatId, c.peerPub, text)
         val ref = db!!.collection("chats").document(chatId)
-        ref.collection("messages").add(mapOf("from" to me, "cipher" to cipher, "ts" to FieldValue.serverTimestamp(), "delivered" to false))
+        ref.collection("messages").add(mapOf("from" to me, "cipher" to cipher, "ts" to FieldValue.serverTimestamp(), "delivered" to false) +
+            replyFields(chatId, c.peerPub, reply))
         ref.update(mapOf("last" to cipher, "lastFrom" to me, "updated" to FieldValue.serverTimestamp()))
     }
 
@@ -333,7 +359,7 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
 
     /** Encrypts a photo or file on the phone, stores only ciphertext in Firestore (as Blob chunks), then posts the message.
      *  Returns an error text or null. */
-    suspend fun sendAttachment(chatId: String, uri: Uri, asImage: Boolean): String? {
+    suspend fun sendAttachment(chatId: String, uri: Uri, asImage: Boolean, reply: ReplyRef? = null): String? {
         val me = myUid.value ?: return "Not connected"
         val c = peerOf(chatId) ?: return "Chat not ready yet"
         if (c.peerPub.isBlank()) return "Chat not ready yet. Try again in a moment."
@@ -364,7 +390,7 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
             }
             val (bytes, name, mime) = prepared
             uploadPrepared(chatId, ref, bytes, if (isImage) "image" else "file", name, mime,
-                if (isImage) "📷 Photo" else "📎 $name", JSONObject())
+                if (isImage) "📷 Photo" else "📎 $name", JSONObject(), reply)
         } catch (e: Exception) {
             uploads.remove(msgId)
             uploadError(e)
@@ -383,7 +409,7 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
     /** Encrypts already-prepared bytes on the phone, writes the ciphertext as Firestore Blob chunks, then posts the message.
      *  Shared by photos, files and (v1.5) voice messages. Returns an error text or null. Throws on Firestore errors. */
     private suspend fun uploadPrepared(chatId: String, ref: DocumentReference, bytes: ByteArray, type: String, name: String,
-                                       mime: String, labelText: String, extraMeta: JSONObject): String? {
+                                       mime: String, labelText: String, extraMeta: JSONObject, reply: ReplyRef? = null): String? {
         val me = myUid.value ?: return "Not connected"
         val c = peerOf(chatId) ?: return "Chat not ready yet"
         val d = db ?: return "Not connected"
@@ -406,7 +432,7 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
         withContext(Dispatchers.IO) { try { cacheFile(msgId).writeBytes(cipherBytes) } catch (_: Exception) { } }
         ref.set(mapOf("from" to me, "cipher" to label, "type" to type, "meta" to meta,
             "chunkCount" to count, "size" to cipherBytes.size.toLong(),
-            "ts" to FieldValue.serverTimestamp(), "delivered" to false)).await()
+            "ts" to FieldValue.serverTimestamp(), "delivered" to false) + replyFields(chatId, c.peerPub, reply)).await()
         d.collection("chats").document(chatId).update(mapOf("last" to label, "lastFrom" to me, "updated" to FieldValue.serverTimestamp()))
         uploads.remove(msgId)
         return null
@@ -414,7 +440,7 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
 
     /** v1.5: sends a recorded voice message (AAC in an .m4a container) through the same encrypted chunk path.
      *  The plaintext recording never leaves the phone; the caller deletes the temp file. Returns an error text or null. */
-    suspend fun sendVoice(chatId: String, bytes: ByteArray, durationMs: Long): String? {
+    suspend fun sendVoice(chatId: String, bytes: ByteArray, durationMs: Long, reply: ReplyRef? = null): String? {
         if (myUid.value == null) return "Not connected"
         val c = peerOf(chatId) ?: return "Chat not ready yet"
         if (c.peerPub.isBlank()) return "Chat not ready yet. Try again in a moment."
@@ -426,7 +452,7 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
         uploads[ref.id] = Upload(ref.id, chatId, name, false, 0f, isVoice = true)
         return try {
             uploadPrepared(chatId, ref, bytes, "file", name, "audio/mp4", "🎤 Voice message",
-                JSONObject().put("voice", true).put("dur", durationMs))
+                JSONObject().put("voice", true).put("dur", durationMs), reply)
         } catch (e: Exception) { uploads.remove(ref.id); uploadError(e) }
     }
 
@@ -475,6 +501,16 @@ class ChatRepo(private val ctx: Context, private val crypto: Crypto, private val
         val hidden = hiddenMsgs[chatId] ?: emptySet()
         val cut = chatCut[chatId] ?: 0L
         return all.filter { it.id !in hidden && (it.pending || it.ts > cut) }
+    }
+
+    /** v1.7: true when the quoted original is known to be gone (deleted for everyone). The listener keeps the newest 300
+     *  messages, so an original older than that window is not treated as deleted, just not loaded. */
+    fun replyOriginalDeleted(chatId: String, r: ReplyRef): Boolean {
+        val all = messages[chatId] ?: return false
+        if (all.any { it.id == r.id }) return false
+        if (all.size < 300) return true
+        val oldest = all.firstOrNull()?.ts ?: return false
+        return r.ts > 0 && r.ts >= oldest
     }
 
     /** Chats shown in the list on this phone. */

@@ -6,6 +6,15 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
+import kotlin.math.roundToInt
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLayoutResult
@@ -267,6 +276,11 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
     var fileAction by remember { mutableStateOf<Msg?>(null) }
     var pendingCallVideo by remember { mutableStateOf<Boolean?>(null) }
     var linkToOpen by remember { mutableStateOf<String?>(null) }
+    // ---- v1.7 reply to a message ----
+    var replyTo by remember(chatId) { mutableStateOf<Msg?>(null) }
+    var highlightId by remember { mutableStateOf<String?>(null) }
+    val haptic = LocalHapticFeedback.current
+    fun takeReply(): ReplyRef? = replyTo?.let { ReplyRef.of(it) }.also { replyTo = null }
     fun toast(t: String) = Toast.makeText(ctx, t, Toast.LENGTH_LONG).show()
     // ---- v1.5 voice messages ----
     val recorder = remember { VoiceRecorder(ctx.applicationContext) }
@@ -278,7 +292,8 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
     DisposableEffect(Unit) { onDispose { recorder.cancel(); VoicePlayer.stop() } }
     fun sendRecording() {
         val r = recorder.stop() ?: return toast("That was too short. Tap the mic, speak, then tap send.")
-        scope.launch { repo.sendVoice(chatId, r.first, r.second)?.let { toast(it) } }
+        val reply = takeReply()
+        scope.launch { repo.sendVoice(chatId, r.first, r.second, reply)?.let { toast(it) } }
     }
     fun startRecording() {
         if (CallManager.active) return toast("You can't record a voice message during a call.")
@@ -295,7 +310,8 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
     }
     fun upload(uri: Uri?, image: Boolean) {
         if (uri == null) return
-        scope.launch { repo.sendAttachment(chatId, uri, image)?.let { toast(it) } }
+        val reply = takeReply()
+        scope.launch { repo.sendAttachment(chatId, uri, image, reply)?.let { toast(it) } }
     }
     val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { upload(it, true) }
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { upload(it, false) }
@@ -361,7 +377,12 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = WaGreen))
         },
         bottomBar = {
-            Row(Modifier.fillMaxWidth().background(WaBg).navigationBarsPadding().imePadding().padding(horizontal = 6.dp, vertical = 6.dp), verticalAlignment = Alignment.Bottom) {
+          Column(Modifier.fillMaxWidth().background(WaBg).navigationBarsPadding().imePadding()) {
+            // v1.7: WhatsApp-style quoted preview while composing a reply (X cancels).
+            replyTo?.let { r ->
+                ReplyComposeStrip(r, repo.myUid.value, chat?.peerName ?: "", Modifier.padding(start = 6.dp, end = 64.dp, top = 6.dp)) { replyTo = null }
+            }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 6.dp), verticalAlignment = Alignment.Bottom) {
               if (recording) {
                 IconButton(onClick = { recorder.cancel() }) { Icon(Icons.Default.Delete, "Cancel recording", tint = Color(0xFFD32F2F)) }
                 Row(Modifier.weight(1f).height(52.dp).shadow(1.dp, RoundedCornerShape(26.dp)).clip(RoundedCornerShape(26.dp)).background(Color.White).padding(horizontal = 16.dp),
@@ -395,11 +416,12 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                 }
                 Spacer(Modifier.width(6.dp))
                 val empty = text.isBlank()
-                FloatingActionButton(onClick = { if (empty) mic() else { repo.send(chatId, text.trim()); text = "" } }, containerColor = WaGreen, shape = CircleShape, modifier = Modifier.size(52.dp)) {
+                FloatingActionButton(onClick = { if (empty) mic() else { repo.send(chatId, text.trim(), takeReply()); text = "" } }, containerColor = WaGreen, shape = CircleShape, modifier = Modifier.size(52.dp)) {
                     Icon(if (empty) Icons.Default.Mic else Icons.Default.Send, if (empty) "Record voice message" else "Send", tint = Color.White)
                 }
               }
             }
+          }
         },
         containerColor = WaBg
     ) { pad ->
@@ -415,12 +437,30 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                 val newDay = prev == null || !sameDay(prev.ts, m.ts)
                 val first = newDay || prev?.from != m.from
                 if (newDay) DayChip(m.ts)
-                Row(Modifier.fillMaxWidth().padding(top = if (first) 6.dp else 1.5.dp), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+                // v1.7: swipe right on a bubble to reply (and a brief highlight when jumped to from a quote).
+                SwipeToReply(onReply = { replyTo = m; haptic.performHapticFeedback(HapticFeedbackType.LongPress) }) {
+                Row(Modifier.fillMaxWidth().background(if (highlightId == m.id) Color(0x3353BDEB) else Color.Transparent)
+                    .padding(top = if (first) 6.dp else 1.5.dp), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
                     val shape = BubbleShape(mine, first)
-                    Column(Modifier.widthIn(max = 300.dp).shadow(0.6.dp, shape).clip(shape).background(if (mine) OutBubble else InBubble)
+                    Column(Modifier.widthIn(max = 300.dp).then(if (m.reply != null) Modifier.width(IntrinsicSize.Max) else Modifier)
+                        .shadow(0.6.dp, shape).clip(shape).background(if (mine) OutBubble else InBubble)
                         .combinedClickable(onClick = {}, onLongClick = { msgMenu = m })
                         .padding(start = if (mine) 4.dp else 4.dp + TAIL_DP.dp, end = if (mine) 4.dp + TAIL_DP.dp else 4.dp, top = 4.dp, bottom = 3.dp)
                         .padding(horizontal = if (m.type == "image") 0.dp else 5.dp)) {
+                        m.reply?.let { r ->
+                            QuoteBlock(r, repo.myUid.value, chat?.peerName ?: "", deleted = repo.replyOriginalDeleted(chatId, r), mine = mine,
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
+                                val idx = msgs.indexOfFirst { it.id == r.id }
+                                when {
+                                    idx >= 0 -> scope.launch {
+                                        list.animateScrollToItem(idx + 1) // +1 for the encryption notice item at the top
+                                        highlightId = r.id; delay(1200); if (highlightId == r.id) highlightId = null
+                                    }
+                                    repo.replyOriginalDeleted(chatId, r) -> {}
+                                    else -> toast("The original message isn't loaded on this phone.")
+                                }
+                            }
+                        }
                         when (m.type) {
                             "image" -> ImageThumb(repo, chatId, m, saving = m.id in savingPhotos, onSave = { saveToGallery(m) }, onLong = { msgMenu = m }) { viewing = m }
                             "file" -> if (m.voice) VoiceRow(repo, chatId, m, onLong = { msgMenu = m }) { toast(it) }
@@ -436,6 +476,7 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                             }
                         }
                     }
+                }
                 }
             }
             items(pendingUploads, key = { "up_" + it.id }) { u ->
@@ -475,6 +516,7 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
             title = { Text("Message") },
             text = {
                 Column {
+                    TextButton(onClick = { msgMenu = null; replyTo = m }, modifier = Modifier.fillMaxWidth()) { Text("Reply", Modifier.fillMaxWidth()) }
                     TextButton(onClick = { msgMenu = null; confirmMsg = m to false }, modifier = Modifier.fillMaxWidth()) { Text("Delete for me", Modifier.fillMaxWidth()) }
                     if (mine) TextButton(onClick = { msgMenu = null; confirmMsg = m to true }, modifier = Modifier.fillMaxWidth()) {
                         Text("Delete for everyone", Modifier.fillMaxWidth(), color = Color(0xFFD32F2F)) }
@@ -491,6 +533,7 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                 TextButton(onClick = {
                     confirmMsg = null
                     if (VoicePlayer.current.value == m.id) VoicePlayer.stop()
+                    if (replyTo?.id == m.id) replyTo = null
                     if (!everyone) repo.deleteMessageForMe(chatId, m)
                     else scope.launch { repo.deleteMessageForEveryone(chatId, m)?.let { toast(it) } }
                 }) { Text("Delete", color = Color(0xFFD32F2F)) }
@@ -871,3 +914,75 @@ private fun dayLabel(t: Long): String {
 
 /** Time shown inside a bubble (the day is in the chip above). */
 private fun clock(t: Long): String = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(t))
+
+// ===================== v1.7: reply to a message =====================
+
+private val ReplyBarColor = Color(0xFF06CF9C)
+private val ReplyNameColor = Color(0xFF7F66FF)
+
+private fun replyName(from: String, myUid: String?, peerName: String): String =
+    if (from.isNotBlank() && from == myUid) "You" else if (peerName.isNotBlank()) "@$peerName" else ""
+
+private fun replySnippet(kind: String, text: String): String = when (kind) {
+    "image" -> "📷 Photo"; "voice" -> "🎤 Voice message"; "file" -> "📎 File"; else -> text.replace('\n', ' ')
+}
+
+/** Swipe a bubble right past ~64 dp to reply; it springs back. Vertical scrolling and taps/long-presses are unaffected. */
+@Composable
+private fun SwipeToReply(onReply: () -> Unit, content: @Composable () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val offset = remember { Animatable(0f) }
+    val trigger = with(LocalDensity.current) { 64.dp.toPx() }
+    val max = with(LocalDensity.current) { 96.dp.toPx() }
+    var fired by remember { mutableStateOf(false) }
+    Box(Modifier.fillMaxWidth().pointerInput(Unit) {
+        detectHorizontalDragGestures(
+            onDragStart = { fired = false },
+            onDragEnd = { if (offset.value >= trigger) onReply(); scope.launch { offset.animateTo(0f, tween(180)) } },
+            onDragCancel = { scope.launch { offset.animateTo(0f, tween(180)) } },
+            onHorizontalDrag = { change, dx ->
+                val next = (offset.value + dx).coerceIn(0f, max)
+                if (next != offset.value) change.consume()
+                scope.launch { offset.snapTo(next) }
+            })
+    }) {
+        val progress = (offset.value / trigger).coerceIn(0f, 1f)
+        if (offset.value > 0f) Box(Modifier.align(Alignment.CenterStart).padding(start = 8.dp).size(30.dp).alpha(progress)
+            .clip(CircleShape).background(Color(0x22000000)), contentAlignment = Alignment.Center) {
+            Icon(Icons.Default.Reply, "Reply", tint = Color(0xFF54656F), modifier = Modifier.size(18.dp))
+        }
+        Box(Modifier.offset { IntOffset(offset.value.roundToInt(), 0) }) { content() }
+    }
+}
+
+/** Quoted block shown on top of a reply bubble. Tap jumps to the original. */
+@Composable
+private fun QuoteBlock(r: ReplyRef, myUid: String?, peerName: String, deleted: Boolean, mine: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val name = replyName(r.from, myUid, peerName)
+    val barColor = if (r.from == myUid) ReplyBarColor else ReplyNameColor
+    Row(modifier.height(IntrinsicSize.Min).clip(RoundedCornerShape(6.dp)).background(if (mine) Color(0x1A000000) else Color(0x0F000000)).clickable { onClick() }) {
+        Box(Modifier.width(4.dp).fillMaxHeight().background(barColor))
+        Column(Modifier.padding(horizontal = 8.dp, vertical = 5.dp)) {
+            if (name.isNotBlank()) Text(name, color = barColor, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(if (deleted) "🚫 Message deleted" else replySnippet(r.kind, r.text).ifBlank { "Message" }, color = WaSub, fontSize = 13.sp,
+                maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+    }
+}
+
+/** Preview strip above the input while composing a reply. */
+@Composable
+private fun ReplyComposeStrip(m: Msg, myUid: String?, peerName: String, modifier: Modifier = Modifier, onCancel: () -> Unit) {
+    val r = ReplyRef.of(m)
+    val name = replyName(r.from, myUid, peerName)
+    val barColor = if (r.from == myUid) ReplyBarColor else ReplyNameColor
+    Row(modifier.fillMaxWidth().height(IntrinsicSize.Min).shadow(1.dp, RoundedCornerShape(12.dp)).clip(RoundedCornerShape(12.dp)).background(Color.White),
+        verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.width(4.dp).fillMaxHeight().background(barColor))
+        Column(Modifier.weight(1f).padding(horizontal = 10.dp, vertical = 6.dp)) {
+            Text(name.ifBlank { "Reply" }, color = barColor, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(replySnippet(r.kind, r.text).ifBlank { "Message" }, color = WaSub, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        IconButton(onClick = onCancel, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.Close, "Cancel reply", tint = WaSub, modifier = Modifier.size(18.dp)) }
+    }
+}

@@ -39,6 +39,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.ui.draw.shadow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -63,6 +65,14 @@ import java.util.*
 private val WaGreen = Color(0xFF008069)
 private val WaBg = Color(0xFFEFE7DE)
 private val OutBubble = Color(0xFFD9FDD3)
+// v1.6 WhatsApp-style palette (visual only)
+private val InBubble = Color.White
+private val WaLight = Color(0xFF25D366)
+private val WaText = Color(0xFF111B21)
+private val WaSub = Color(0xFF667781)
+private val WaDivider = Color(0xFFE9EDEF)
+private val AvatarColors = listOf(Color(0xFF00A884), Color(0xFF7F66FF), Color(0xFFFF8A65), Color(0xFF53BDEB),
+    Color(0xFFE26AB6), Color(0xFF3BA55C), Color(0xFFFFA000), Color(0xFF5C6BC0), Color(0xFFEF5350), Color(0xFF26A69A))
 
 private sealed class H { object List : H(); data class Chat(val id: String) : H(); object New : H(); object Settings : H() }
 
@@ -149,7 +159,7 @@ private fun ChatList(repo: ChatRepo, onOpen: (String) -> Unit, onNew: () -> Unit
         LazyColumn(Modifier.padding(pad)) {
             // v1.4: quiet missed-call entries for calls that rang and ended while chats were locked (memory only).
             items(missed, key = { "missed_" + it.callId }) { m ->
-                Row(Modifier.fillMaxWidth().background(Color(0xFFF7F7F7)).padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                Row(Modifier.fillMaxWidth().background(Color(0xFFFFF5F5)).padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     Icon(if (m.video) Icons.Default.Videocam else Icons.Default.Call, null, tint = Color(0xFFE53935), modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(10.dp))
@@ -160,21 +170,34 @@ private fun ChatList(repo: ChatRepo, onOpen: (String) -> Unit, onNew: () -> Unit
             }
             items(visible, key = { it.id }) { c ->
                 val unread = repo.unread[c.id] ?: 0
+                // v1.6: WhatsApp-style row: round avatar, name + time on top, preview + unread badge below, inset divider.
                 Row(Modifier.fillMaxWidth().combinedClickable(onClick = { if (deleting != c.id) onOpen(c.id) }, onLongClick = { if (deleting == null) chatMenu = c })
-                    .padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Avatar(c.peerName)
+                    .padding(start = 16.dp, end = 16.dp, top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Avatar(c.peerName, 52)
                     Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("@${c.peerName}", fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
-                        val (prev, fromMe) = repo.previewOf(c)
-                        Text(if (deleting == c.id) "Deleting..." else (if (fromMe && prev.isNotBlank()) "You: " else "") + prev.ifBlank { "Say hi 👋" },
-                            color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
-                    Column(horizontalAlignment = Alignment.End) {
-                        Text(time(c.updated), fontSize = 12.sp, color = if (unread > 0) Color(0xFF25D366) else Color.Gray)
-                        if (unread > 0) Box(Modifier.padding(top = 4.dp).size(20.dp).clip(CircleShape).background(Color(0xFF25D366)), contentAlignment = Alignment.Center) {
-                            Text("$unread", color = Color.White, fontSize = 11.sp)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("@${c.peerName}", fontWeight = if (unread > 0) FontWeight.Bold else FontWeight.SemiBold, fontSize = 16.5.sp, color = WaText,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            Spacer(Modifier.width(8.dp))
+                            Text(time(c.updated), fontSize = 12.sp, color = if (unread > 0) WaLight else WaSub,
+                                fontWeight = if (unread > 0) FontWeight.SemiBold else FontWeight.Normal)
                         }
+                        Spacer(Modifier.height(3.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            val (prev, fromMe) = repo.previewOf(c)
+                            Text(if (deleting == c.id) "Deleting..." else (if (fromMe && prev.isNotBlank()) "You: " else "") + prev.ifBlank { "Say hi 👋" },
+                                color = if (unread > 0) WaText else WaSub, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            if (unread > 0) {
+                                Spacer(Modifier.width(8.dp))
+                                Box(Modifier.defaultMinSize(minWidth = 20.dp, minHeight = 20.dp).clip(CircleShape).background(WaLight).padding(horizontal = 5.dp),
+                                    contentAlignment = Alignment.Center) {
+                                    Text(if (unread > 99) "99+" else "$unread", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        HorizontalDivider(color = WaDivider, thickness = 0.8.dp)
                     }
                 }
             }
@@ -211,10 +234,12 @@ private fun ChatList(repo: ChatRepo, onOpen: (String) -> Unit, onNew: () -> Unit
     }
 }
 
+/** v1.6: round avatar with the first letter of the username on a colour picked from the name (same name, same colour). */
 @Composable
-private fun Avatar(name: String) {
-    Box(Modifier.size(46.dp).clip(CircleShape).background(Color(0xFFDFE5E7)), contentAlignment = Alignment.Center) {
-        Text(name.take(1).uppercase(), fontWeight = FontWeight.Bold, color = Color(0xFF54656F), fontSize = 18.sp)
+private fun Avatar(name: String, sizeDp: Int = 46) {
+    val bg = AvatarColors[Math.floorMod(name.lowercase().hashCode(), AvatarColors.size)]
+    Box(Modifier.size(sizeDp.dp).clip(CircleShape).background(bg), contentAlignment = Alignment.Center) {
+        Text(name.take(1).uppercase().ifBlank { "?" }, fontWeight = FontWeight.SemiBold, color = Color.White, fontSize = (sizeDp * 0.42f).sp)
     }
 }
 
@@ -294,11 +319,41 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
             toast(if (ok) "Saved" else "Couldn't save the file")
         }
     }
+    // ---- v1.6: manual "Save to gallery" (never automatic) ----
+    // Uses the same loadAttachment() decrypt path the chat uses to show the photo, so it works for every photo that displays.
+    var savingPhotos by remember { mutableStateOf(setOf<String>()) }
+    var pendingGallery by remember { mutableStateOf<Msg?>(null) }
+    fun shortToast(t: String) = Toast.makeText(ctx, t, Toast.LENGTH_SHORT).show()
+    fun doSaveToGallery(m: Msg) {
+        if (m.id in savingPhotos) return
+        savingPhotos = savingPhotos + m.id
+        PrivacyLock.touch()
+        scope.launch {
+            val b = repo.loadAttachment(chatId, m)
+            val ok = b != null && withContext(Dispatchers.IO) { try { Gallery.saveImage(ctx, b, m.mime) } catch (_: Exception) { false } }
+            savingPhotos = savingPhotos - m.id
+            shortToast(when { ok -> "Saved to gallery"; b == null -> "Couldn't load the photo. Check your connection."; else -> "Couldn't save to gallery" })
+        }
+    }
+    // Android 8-9 only. The permission dialog doesn't stop the activity, so the privacy lock needs no grace for it
+    // (same as the mic/camera permission requests).
+    val galleryPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        val m = pendingGallery; pendingGallery = null
+        if (m != null) { if (ok) doSaveToGallery(m) else shortToast("Allow storage access to save photos to the gallery.") }
+    }
+    fun saveToGallery(m: Msg) {
+        if (Gallery.needsPermission && !hasPermissions(ctx, arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE))) {
+            pendingGallery = m; galleryPerm.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else doSaveToGallery(m)
+    }
     Scaffold(
         topBar = {
             TopAppBar(
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Back", tint = Color.White) } },
-                title = { Row(verticalAlignment = Alignment.CenterVertically) { Avatar(chat?.peerName ?: "?"); Spacer(Modifier.width(10.dp)); Text("@${chat?.peerName ?: ""}", color = Color.White, maxLines = 1, overflow = TextOverflow.Ellipsis) } },
+                title = { Row(verticalAlignment = Alignment.CenterVertically) {
+                    Avatar(chat?.peerName ?: "?", 38); Spacer(Modifier.width(10.dp))
+                    Text("@${chat?.peerName ?: ""}", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                } },
                 actions = {
                     IconButton(onClick = { call(true) }) { Icon(Icons.Default.Videocam, "Video call", tint = Color.White) }
                     IconButton(onClick = { call(false) }) { Icon(Icons.Default.Call, "Voice call", tint = Color.White) }
@@ -306,36 +361,41 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = WaGreen))
         },
         bottomBar = {
-            Row(Modifier.fillMaxWidth().background(WaBg).navigationBarsPadding().imePadding().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().background(WaBg).navigationBarsPadding().imePadding().padding(horizontal = 6.dp, vertical = 6.dp), verticalAlignment = Alignment.Bottom) {
               if (recording) {
                 IconButton(onClick = { recorder.cancel() }) { Icon(Icons.Default.Delete, "Cancel recording", tint = Color(0xFFD32F2F)) }
-                Row(Modifier.weight(1f).height(48.dp).clip(RoundedCornerShape(24.dp)).background(Color.White).padding(horizontal = 16.dp),
+                Row(Modifier.weight(1f).height(52.dp).shadow(1.dp, RoundedCornerShape(26.dp)).clip(RoundedCornerShape(26.dp)).background(Color.White).padding(horizontal = 16.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(10.dp).clip(CircleShape).background(Color(0xFFE53935)))
                     Spacer(Modifier.width(10.dp))
                     Text("Recording  ${dur(recElapsed)} / ${dur(MAX_VOICE_MS)}", color = Color(0xFF54656F))
                 }
                 Spacer(Modifier.width(6.dp))
-                FloatingActionButton(onClick = { sendRecording() }, containerColor = WaGreen, shape = CircleShape, modifier = Modifier.size(48.dp)) {
+                FloatingActionButton(onClick = { sendRecording() }, containerColor = WaGreen, shape = CircleShape, modifier = Modifier.size(52.dp)) {
                     Icon(Icons.Default.Send, "Send voice message", tint = Color.White)
                 }
               } else {
-                Box {
-                    IconButton(onClick = { attachMenu = true }) { Icon(Icons.Default.AttachFile, "Attach", tint = Color(0xFF54656F)) }
-                    DropdownMenu(attachMenu, { attachMenu = false }) {
-                        DropdownMenuItem(text = { Text("Photo") }, leadingIcon = { Icon(Icons.Default.Image, null) }, onClick = {
-                            attachMenu = false; App.allowExternal(); pickPhoto.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) })
-                        DropdownMenuItem(text = { Text("File") }, leadingIcon = { Icon(Icons.Default.InsertDriveFile, null) }, onClick = {
-                            attachMenu = false; App.allowExternal(); pickFile.launch("*/*") })
+                // v1.6: WhatsApp-style rounded "pill" holding the text field and the attach button.
+                Row(Modifier.weight(1f).shadow(1.dp, RoundedCornerShape(26.dp)).clip(RoundedCornerShape(26.dp)).background(Color.White).padding(start = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    // Plain text field: pasted links are kept exactly as pasted (nothing filters or rewrites them).
+                    // Typing counts as activity for the idle lock (soft-keyboard input doesn't reach onUserInteraction).
+                    TextField(text, { text = it; PrivacyLock.touch() }, placeholder = { Text("Message", color = WaSub) }, modifier = Modifier.weight(1f), maxLines = 5,
+                        colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
+                            focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
+                    Box {
+                        IconButton(onClick = { attachMenu = true }) { Icon(Icons.Default.AttachFile, "Attach", tint = WaSub) }
+                        DropdownMenu(attachMenu, { attachMenu = false }) {
+                            DropdownMenuItem(text = { Text("Photo") }, leadingIcon = { Icon(Icons.Default.Image, null) }, onClick = {
+                                attachMenu = false; App.allowExternal(); pickPhoto.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) })
+                            DropdownMenuItem(text = { Text("File") }, leadingIcon = { Icon(Icons.Default.InsertDriveFile, null) }, onClick = {
+                                attachMenu = false; App.allowExternal(); pickFile.launch("*/*") })
+                        }
                     }
                 }
-                // Plain text field: pasted links are kept exactly as pasted (nothing filters or rewrites them).
-                // Typing counts as activity for the idle lock (soft-keyboard input doesn't reach onUserInteraction).
-                TextField(text, { text = it; PrivacyLock.touch() }, placeholder = { Text("Message") }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(24.dp), maxLines = 5,
-                    colors = TextFieldDefaults.colors(focusedContainerColor = Color.White, unfocusedContainerColor = Color.White, focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
                 Spacer(Modifier.width(6.dp))
                 val empty = text.isBlank()
-                FloatingActionButton(onClick = { if (empty) mic() else { repo.send(chatId, text.trim()); text = "" } }, containerColor = WaGreen, shape = CircleShape, modifier = Modifier.size(48.dp)) {
+                FloatingActionButton(onClick = { if (empty) mic() else { repo.send(chatId, text.trim()); text = "" } }, containerColor = WaGreen, shape = CircleShape, modifier = Modifier.size(52.dp)) {
                     Icon(if (empty) Icons.Default.Mic else Icons.Default.Send, if (empty) "Record voice message" else "Send", tint = Color.White)
                 }
               }
@@ -343,22 +403,32 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
         },
         containerColor = WaBg
     ) { pad ->
-        LazyColumn(Modifier.padding(pad).fillMaxSize(), state = list, contentPadding = PaddingValues(8.dp)) {
-            item { Text("🔒 Messages are end-to-end encrypted.", fontSize = 12.sp, color = Color(0xFF54656F),
-                modifier = Modifier.fillMaxWidth().padding(8.dp).background(Color(0xFFFFF3C4), RoundedCornerShape(8.dp)).padding(8.dp)) }
-            items(msgs, key = { it.id }) { m ->
+        LazyColumn(Modifier.padding(pad).fillMaxSize(), state = list, contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp)) {
+            item { Box(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp), contentAlignment = Alignment.Center) {
+                Text("🔒 Messages are end-to-end encrypted.", fontSize = 12.sp, color = Color(0xFF54656F), textAlign = TextAlign.Center,
+                    modifier = Modifier.background(Color(0xFFFFF3C4), RoundedCornerShape(8.dp)).padding(horizontal = 10.dp, vertical = 6.dp))
+            } }
+            itemsIndexed(msgs, key = { _, it -> it.id }) { i, m ->
                 val mine = m.from == repo.myUid.value
-                Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
-                    Column(Modifier.widthIn(max = 280.dp).clip(RoundedCornerShape(10.dp)).background(if (mine) OutBubble else Color.White)
-                        .combinedClickable(onClick = {}, onLongClick = { msgMenu = m }).padding(horizontal = 10.dp, vertical = 6.dp)) {
+                // v1.6: day chip when the day changes; bubble tail only on the first message of a run from the same person.
+                val prev = msgs.getOrNull(i - 1)
+                val newDay = prev == null || !sameDay(prev.ts, m.ts)
+                val first = newDay || prev?.from != m.from
+                if (newDay) DayChip(m.ts)
+                Row(Modifier.fillMaxWidth().padding(top = if (first) 6.dp else 1.5.dp), horizontalArrangement = if (mine) Arrangement.End else Arrangement.Start) {
+                    val shape = BubbleShape(mine, first)
+                    Column(Modifier.widthIn(max = 300.dp).shadow(0.6.dp, shape).clip(shape).background(if (mine) OutBubble else InBubble)
+                        .combinedClickable(onClick = {}, onLongClick = { msgMenu = m })
+                        .padding(start = if (mine) 4.dp else 4.dp + TAIL_DP.dp, end = if (mine) 4.dp + TAIL_DP.dp else 4.dp, top = 4.dp, bottom = 3.dp)
+                        .padding(horizontal = if (m.type == "image") 0.dp else 5.dp)) {
                         when (m.type) {
-                            "image" -> ImageThumb(repo, chatId, m, onLong = { msgMenu = m }) { viewing = m }
+                            "image" -> ImageThumb(repo, chatId, m, saving = m.id in savingPhotos, onSave = { saveToGallery(m) }, onLong = { msgMenu = m }) { viewing = m }
                             "file" -> if (m.voice) VoiceRow(repo, chatId, m, onLong = { msgMenu = m }) { toast(it) }
                                 else FileRow(m, repo.downloads[m.id], onLong = { msgMenu = m }) { if (m.available) fileAction = m else toast("This file isn't available. It was sent from an older version of the app.") }
                             else -> LinkText(m.text, onLong = { msgMenu = m }) { linkToOpen = it }
                         }
-                        Row(Modifier.align(Alignment.End), verticalAlignment = Alignment.CenterVertically) {
-                            Text(time(m.ts), fontSize = 11.sp, color = Color.Gray)
+                        Row(Modifier.align(Alignment.End).padding(start = 12.dp, end = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(clock(m.ts), fontSize = 11.sp, color = WaSub)
                             if (mine) {
                                 Spacer(Modifier.width(4.dp))
                                 Icon(when { m.pending -> Icons.Default.Schedule; m.delivered -> Icons.Default.DoneAll; else -> Icons.Default.Done }, null,
@@ -369,8 +439,10 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
                 }
             }
             items(pendingUploads, key = { "up_" + it.id }) { u ->
-                Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), horizontalArrangement = Arrangement.End) {
-                    Column(Modifier.widthIn(min = 180.dp, max = 280.dp).background(OutBubble, RoundedCornerShape(10.dp)).padding(10.dp)) {
+                Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.End) {
+                    val shape = BubbleShape(mine = true, tail = true)
+                    Column(Modifier.widthIn(min = 180.dp, max = 300.dp).shadow(0.6.dp, shape).clip(shape).background(OutBubble)
+                        .padding(start = 10.dp, end = 10.dp + TAIL_DP.dp, top = 10.dp, bottom = 10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(when { u.isVoice -> Icons.Default.Mic; u.isImage -> Icons.Default.Image; else -> Icons.Default.InsertDriveFile }, null, tint = Color(0xFF54656F), modifier = Modifier.size(20.dp))
                             Spacer(Modifier.width(6.dp))
@@ -385,7 +457,7 @@ private fun ChatScreen(repo: ChatRepo, chatId: String, onBack: () -> Unit) {
             }
         }
     }
-    viewing?.let { m -> FullImage(repo, chatId, m) { viewing = null } }
+    viewing?.let { m -> FullImage(repo, chatId, m, saving = m.id in savingPhotos, onSave = { saveToGallery(m) }) { viewing = null } }
     linkToOpen?.let { url ->
         AlertDialog(onDismissRequest = { linkToOpen = null },
             title = { Text("Open link?") },
@@ -569,7 +641,7 @@ private fun decodeSampled(bytes: ByteArray, maxSide: Int): Bitmap? {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ImageThumb(repo: ChatRepo, chatId: String, m: Msg, onLong: () -> Unit, onOpen: () -> Unit) {
+private fun ImageThumb(repo: ChatRepo, chatId: String, m: Msg, saving: Boolean, onSave: () -> Unit, onLong: () -> Unit, onOpen: () -> Unit) {
     var bmp by remember(m.id) { mutableStateOf<Bitmap?>(null) }
     var failed by remember(m.id) { mutableStateOf(false) }
     val progress = repo.downloads[m.id]
@@ -578,8 +650,12 @@ private fun ImageThumb(repo: ChatRepo, chatId: String, m: Msg, onLong: () -> Uni
         if (b == null) failed = true else bmp = withContext(Dispatchers.Default) { decodeSampled(b, 800) }.also { if (it == null) failed = true }
     }
     val b = bmp
-    if (b != null) Image(b.asImageBitmap(), "Photo", contentScale = ContentScale.Crop,
-        modifier = Modifier.width(240.dp).heightIn(max = 320.dp).aspectRatio(b.width.toFloat() / b.height.coerceAtLeast(1)).clip(RoundedCornerShape(8.dp)).combinedClickable(onClick = onOpen, onLongClick = onLong))
+    if (b != null) Box {
+        Image(b.asImageBitmap(), "Photo", contentScale = ContentScale.Crop,
+            modifier = Modifier.width(240.dp).heightIn(max = 320.dp).aspectRatio(b.width.toFloat() / b.height.coerceAtLeast(1)).clip(RoundedCornerShape(8.dp)).combinedClickable(onClick = onOpen, onLongClick = onLong))
+        // v1.6: manual Save to gallery (only shown once the photo has loaded, i.e. it could be decrypted).
+        SaveButton(saving, onSave, Modifier.align(Alignment.BottomEnd).padding(6.dp))
+    }
     else Box(Modifier.size(240.dp, 180.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFFDFE5E7)).combinedClickable(onClick = {}, onLongClick = onLong), contentAlignment = Alignment.Center) {
         when {
             failed && !m.available -> Text("📷 Photo unavailable\n(sent from an older version)", color = Color.Gray, fontSize = 13.sp, textAlign = TextAlign.Center)
@@ -590,8 +666,17 @@ private fun ImageThumb(repo: ChatRepo, chatId: String, m: Msg, onLong: () -> Uni
     }
 }
 
+/** v1.6: small round "Save to gallery" button drawn over a photo. */
 @Composable
-private fun FullImage(repo: ChatRepo, chatId: String, m: Msg, onClose: () -> Unit) {
+private fun SaveButton(saving: Boolean, onSave: () -> Unit, modifier: Modifier = Modifier) {
+    Box(modifier.size(36.dp).clip(CircleShape).background(Color(0x99000000)).clickable(enabled = !saving) { onSave() }, contentAlignment = Alignment.Center) {
+        if (saving) CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+        else Icon(Icons.Default.Download, "Save to gallery", tint = Color.White, modifier = Modifier.size(20.dp))
+    }
+}
+
+@Composable
+private fun FullImage(repo: ChatRepo, chatId: String, m: Msg, saving: Boolean, onSave: () -> Unit, onClose: () -> Unit) {
     var bmp by remember(m.id) { mutableStateOf<Bitmap?>(null) }
     LaunchedEffect(m.id) { repo.loadAttachment(chatId, m)?.let { b -> bmp = withContext(Dispatchers.Default) { decodeSampled(b, 2048) } } }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false, securePolicy = androidx.compose.ui.window.SecureFlagPolicy.SecureOn)) {
@@ -600,6 +685,12 @@ private fun FullImage(repo: ChatRepo, chatId: String, m: Msg, onClose: () -> Uni
             if (b != null) Image(b.asImageBitmap(), "Photo", contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize())
             else CircularProgressIndicator(color = Color.White)
             IconButton(onClick = onClose, modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(8.dp)) { Icon(Icons.Default.Close, "Close", tint = Color.White) }
+            if (b != null) TextButton(onClick = onSave, enabled = !saving, modifier = Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(8.dp)) {
+                if (saving) CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                else Icon(Icons.Default.Download, null, tint = Color.White)
+                Spacer(Modifier.width(6.dp))
+                Text("Save to gallery", color = Color.White)
+            }
         }
     }
 }
@@ -726,3 +817,57 @@ private fun time(t: Long): String {
     val same = now.get(Calendar.DAY_OF_YEAR) == c.get(Calendar.DAY_OF_YEAR) && now.get(Calendar.YEAR) == c.get(Calendar.YEAR)
     return SimpleDateFormat(if (same) "h:mm a" else "d MMM", Locale.getDefault()).format(Date(t))
 }
+
+// ===================== v1.6: WhatsApp-style bubbles (visual only) =====================
+
+private const val TAIL_DP = 7
+
+/** Rounded bubble; when [tail] is set, the top corner on the sender's side becomes a small pointed tail (WhatsApp style).
+ *  Space for the tail is always reserved so bubbles in a run line up. */
+private class BubbleShape(private val mine: Boolean, private val tail: Boolean) : androidx.compose.ui.graphics.Shape {
+    override fun createOutline(size: androidx.compose.ui.geometry.Size, layoutDirection: androidx.compose.ui.unit.LayoutDirection,
+                               density: androidx.compose.ui.unit.Density): androidx.compose.ui.graphics.Outline {
+        val t = with(density) { TAIL_DP.dp.toPx() }
+        val r = with(density) { 10.dp.toPx() }
+        val left = if (mine) 0f else t
+        val right = if (mine) size.width - t else size.width
+        val rr = androidx.compose.ui.geometry.CornerRadius(r, r)
+        val zero = androidx.compose.ui.geometry.CornerRadius.Zero
+        val path = androidx.compose.ui.graphics.Path().apply {
+            addRoundRect(androidx.compose.ui.geometry.RoundRect(left, 0f, right, size.height,
+                topLeftCornerRadius = if (tail && !mine) zero else rr, topRightCornerRadius = if (tail && mine) zero else rr,
+                bottomRightCornerRadius = rr, bottomLeftCornerRadius = rr))
+            if (tail) {
+                if (mine) { moveTo(right - 1f, 0f); lineTo(size.width, 0f); lineTo(right - 1f, t * 1.4f); close() }
+                else { moveTo(left + 1f, 0f); lineTo(0f, 0f); lineTo(left + 1f, t * 1.4f); close() }
+            }
+        }
+        return androidx.compose.ui.graphics.Outline.Generic(path)
+    }
+}
+
+/** "Today" / "Yesterday" / date chip between days, like WhatsApp. */
+@Composable
+private fun DayChip(t: Long) {
+    Box(Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 4.dp), contentAlignment = Alignment.Center) {
+        Text(dayLabel(t), fontSize = 12.sp, color = Color(0xFF54656F),
+            modifier = Modifier.shadow(0.5.dp, RoundedCornerShape(8.dp)).background(Color(0xFFFFFFFF), RoundedCornerShape(8.dp)).padding(horizontal = 10.dp, vertical = 5.dp))
+    }
+}
+
+private fun sameDay(a: Long, b: Long): Boolean {
+    val x = Calendar.getInstance().apply { timeInMillis = a }; val y = Calendar.getInstance().apply { timeInMillis = b }
+    return x.get(Calendar.YEAR) == y.get(Calendar.YEAR) && x.get(Calendar.DAY_OF_YEAR) == y.get(Calendar.DAY_OF_YEAR)
+}
+
+private fun dayLabel(t: Long): String {
+    val now = System.currentTimeMillis()
+    return when {
+        sameDay(t, now) -> "Today"
+        sameDay(t, now - 86_400_000L) -> "Yesterday"
+        else -> SimpleDateFormat("d MMMM yyyy", Locale.getDefault()).format(Date(t))
+    }
+}
+
+/** Time shown inside a bubble (the day is in the chip above). */
+private fun clock(t: Long): String = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(t))
